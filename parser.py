@@ -141,7 +141,7 @@ def split_sections(paragraphs):
     current = None
 
     for css_class, text in paragraphs:
-        if css_class == STOP_AT:
+        if css_class in STOP_AT:
             break
         if css_class in BOUNDARIES:
             if current:
@@ -169,6 +169,9 @@ SECTION_BY_CLASS = {
     "Srskiltyttranderubrik": DISSENT,
 }
 
+SIGNATORY_RE = re.compile(
+    rf"^(av\s+)?[A-ZÅÄÖ][\w.\- ]+\({PARTY}\)"
+)
 
 def parse_heading(text):
     """Split a reservation heading into topic, punkter and parties.
@@ -210,7 +213,7 @@ def extract_reservations(blocks, **doc_fields):
             texts.pop()
 
         signatories = ""
-        if texts and texts[0].startswith("av "):
+        if texts and SIGNATORY_RE.match(texts[0]):
             signatories = texts.pop(0)
 
         counters[section] += 1
@@ -225,3 +228,89 @@ def extract_reservations(blocks, **doc_fields):
             **doc_fields,
         ))
     return chunks
+
+
+# ---------------------------------------------------------------------------
+# Ground truth: read by hand from the two test documents.
+# The parser is done when it reproduces this.
+# ---------------------------------------------------------------------------
+
+GROUND_TRUTH = {
+    "HA01AU1": {
+        RESERVATION: [],
+        DISSENT: [
+            {"number": 1, "parties": ["S"]},
+            {"number": 2, "parties": ["V"]},
+            {"number": 3, "parties": ["C"]},
+            {"number": 4, "parties": ["MP"]},
+        ],
+    },
+    "HA01FIU1": {
+        RESERVATION: [
+            {"number": 1, "parties": ["S"], "punkter": [1]},
+            {"number": 2, "parties": ["V"], "punkter": [1]},
+            {"number": 3, "parties": ["C"], "punkter": [1]},
+            {"number": 4, "parties": ["MP"], "punkter": [1]},
+            {"number": 5, "parties": ["S"], "punkter": [2]},
+            {"number": 6, "parties": ["V"], "punkter": [2]},
+            {"number": 7, "parties": ["C"], "punkter": [2]},
+            {"number": 8, "parties": ["MP"], "punkter": [2]},
+        ],
+        DISSENT: [],
+    },
+}
+
+
+def check(dok_id, chunks):
+    """Compare parser output against the ground truth.
+
+    Returns a list of mismatches; an empty list means the document parsed
+    correctly. Counts distinct numbers, so a long reservation may later be
+    split into several chunks without breaking the test.
+    """
+    truth = GROUND_TRUTH.get(dok_id)
+    if truth is None:
+        return [f"no ground truth for {dok_id}"]
+
+    problems = []
+    for section in (RESERVATION, DISSENT):
+        expected = truth[section]
+        got = [c for c in chunks if c.section == section]
+
+        got_numbers = sorted({c.number for c in got if c.number})
+        expected_numbers = sorted(e["number"] for e in expected)
+        if got_numbers != expected_numbers:
+            problems.append(f"{section}: expected {expected_numbers}, got {got_numbers}")
+            continue
+
+        for e in expected:
+            match = next((c for c in got if c.number == e["number"]), None)
+            if match is None:
+                continue
+            if match.parties != e["parties"]:
+                problems.append(
+                    f"{section} {e['number']}: expected parties {e['parties']}, "
+                    f"got {match.parties}"
+                )
+            if match.punkter != e.get("punkter", []):
+                problems.append(
+                    f"{section} {e['number']}: expected punkter "
+                    f"{e.get('punkter', [])}, got {match.punkter}"
+                )
+    return problems
+
+
+if __name__ == "__main__":
+    import sys
+
+    for path in sys.argv[1:]:
+        paragraphs = read_paragraphs(path)
+        info = document_info(path, paragraphs)
+        chunks = extract_reservations(split_sections(paragraphs), **info)
+        problems = check(info["dok_id"], chunks)
+        status = "OK" if not problems else f"{len(problems)} MISMATCHES"
+        print(f"{info['dok_id']:10s} {len(chunks):3d} chunks  {status}")
+        for p in problems:
+            print(f"    {p}")
+
+
