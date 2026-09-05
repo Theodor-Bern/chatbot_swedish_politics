@@ -1,5 +1,13 @@
+# Data — hämtas från data.riksdagen.se, se README
 data/
-__pycache__/
-*.pyc
-.venv/
 out/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
