@@ -3,7 +3,7 @@
 Two phases, deliberately separate — the same lesson the betänkande parser
 taught: never couple fetching to parsing.
 
-    python3 scrapers/scraper.py discover MP    # dry run: what would be fetched
+    python3 scrapers/scraper.py discover SD    # dry run: what would be fetched
     python3 scrapers/scraper.py fetch V        # network, polite, resumable
     python3 scrapers/scraper.py extract V      # offline, repeatable
 
@@ -22,6 +22,7 @@ Dependencies: requests, trafilatura, beautifulsoup4
     pip install requests trafilatura beautifulsoup4
 """
 
+import gzip
 import hashlib
 import json
 import re
@@ -48,8 +49,8 @@ DEFAULT_OUT_DIR = REPO_ROOT / "out"
 # the default python-requests agent outright.
 USER_AGENT = "Mr Robot"
 
-# One request per second. None of these sites are large and there is no
-# reason to hurry.
+# Default one request per second. A party whose robots.txt asks for slower
+# gets its own crawl_delay below.
 DELAY_SECONDS = 1.0
 
 SITEMAP_NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
@@ -62,12 +63,24 @@ MIN_TEXT_CHARS = 150
 class PartySite:
     """Everything party-specific lives here, so adding a party is config.
 
-    Two discovery sources, unioned, because neither is reliable alone: V's
-    page sitemap is complete, while MP's sitemap lists 8 of ~55 topic pages.
-    A party is only missed if BOTH its sitemap and its A-Ö index break.
+    topic_pattern MUST be anchored at the party's own domain. Several of
+    these sites host municipal and regional branches under the same domain
+    (mp.se/vellinge/politik/klimat/), and an unanchored pattern pulls in
+    hundreds of pages of local politics that are not the party's national
+    position.
 
-    index_urls defaults to empty, so a party configured before this existed
-    keeps exactly the behaviour it had.
+    index_only decides whether the party's A-Ö page defines membership. It
+    is False everywhere, because no party's index turned out to be a
+    complete register of its own policy pages: MP's A-Ö omits abort,
+    pensioner and vattenkraft, C's lists only the 29 top-level topics and
+    not their sub-pages, and S's and SD's have no link list at all. So the
+    path pattern defines membership and the index contributes alias labels.
+    What the index does list is recorded per page as sources/in_index, so a
+    curated view is one filter away — decide at retrieval time, not by
+    throwing pages away at collection time.
+
+    crawl_delay is per party because robots.txt is. SD asks for ten seconds
+    between requests and that is a directive, not advice.
 
     robots_checked records the date someone actually read the party's
     robots.txt and confirmed the topic pages are allowed. Keep it honest —
@@ -79,35 +92,109 @@ class PartySite:
     robots_checked: str
     sitemap: str = ""
     index_urls: list = field(default_factory=list)
+    index_only: bool = False
+    crawl_delay: float = DELAY_SECONDS
 
 
 PARTIES = {
-    # V is left exactly as it was when it collected 102 pages successfully.
-    # Its page sitemap is complete, so it needs no index crawl.
     "V": PartySite(
         code="V",
         name="Vänsterpartiet",
         sitemap="https://www.vansterpartiet.se/page-sitemap.xml",
-        topic_pattern=re.compile(r"/var-politik/politik-a-o/[^/]+/?$"),
+        index_urls=["https://www.vansterpartiet.se/var-politik/politik-a-o/"],
+        topic_pattern=re.compile(
+            r"^https://www\.vansterpartiet\.se/var-politik/politik-a-o/"
+            r"[^/]+/?$"),
         robots_checked="2026-09-08",   # only /wp-admin/ disallowed
     ),
-    # MP's sitemap lists 8 topic pages; its A-Ö index lists ~55. Without the
-    # index crawl we would silently collect a tenth of their platform.
     "MP": PartySite(
         code="MP",
         name="Miljöpartiet de gröna",
         sitemap="https://www.mp.se/sitemap.xml",
         index_urls=["https://www.mp.se/politik/"],
-        topic_pattern=re.compile(r"/politik/[^/]+/?$"),
+        topic_pattern=re.compile(r"^https://www\.mp\.se/politik/[^/]+/?$"),
         robots_checked="2026-09-08",   # only /wp-content/uploads/ir_cache/
     ),
-    # S, SD, M, C, KD, L go here — one entry each, no new code.
+    "S": PartySite(
+        code="S",
+        name="Socialdemokraterna",
+        sitemap="https://www.socialdemokraterna.se/rest-api/sitemapXml",
+        # No index_urls: their A-Ö page is a JavaScript search box, not a
+        # link list, so there is nothing for BeautifulSoup to find.
+        topic_pattern=re.compile(
+            r"^https://www\.socialdemokraterna\.se/var-politik/a-till-o/"
+            r"[^/]+/?$"),
+        robots_checked="2026-09-08",   # nothing under /var-politik/ blocked
+    ),
+    "C": PartySite(
+        code="C",
+        name="Centerpartiet",
+        sitemap="https://www.centerpartiet.se/sitemapindex.xml",
+        index_urls=["https://www.centerpartiet.se/centerpartiets-politik/"
+                    "centerpartiets-politik-a-o"],
+        # Two levels: 29 topics, each with sub-pages such as
+        # …/digitalisering/artificiell-intelligens-ai. The sub-pages hold the
+        # specific answers and are the granularity people ask about.
+        topic_pattern=re.compile(
+            r"^https://www\.centerpartiet\.se/centerpartiets-politik/"
+            r"centerpartiets-politik-a-o/[^/]+(/[^/]+)?/?$"),
+        robots_checked="2026-09-08",   # same Sitevision ruleset as S
+    ),
+    "SD": PartySite(
+        code="SD",
+        name="Sverigedemokraterna",
+        sitemap="https://www.sd.se/sitemap_index.xml",
+        # They publish a dedicated a-o-matters sitemap: 368 pages under
+        # /a-till-o/, their register in full. Their /var-politik/ page is a
+        # thematic summary, not a link list, so there is no index to crawl.
+        topic_pattern=re.compile(r"^https://www\.sd\.se/a-till-o/[^/]+/?$"),
+        crawl_delay=10.0,              # their robots.txt asks for it
+        robots_checked="2026-09-08",
+    ),
+        "M": PartySite(
+        code="M",
+        name="Moderaterna",
+        sitemap="https://moderaterna.se/sitemap_index.xml",
+        index_urls=["https://moderaterna.se/var-politik/"],
+        # No "www." — moderaterna.se serves without it, unlike every other
+        # party so far. And the anchor matters more here than anywhere else:
+        # they run 26 regional multisites under the same domain
+        # (moderaterna.se/skane/var-politik/…), each with its own sitemap
+        # listed in robots.txt.
+        topic_pattern=re.compile(
+            r"^https://moderaterna\.se/var-politik/[^/]+/?$"),
+        robots_checked="2026-09-09",
+    ),
+        "KD": PartySite(
+        code="KD",
+        name="Kristdemokraterna",
+        # No sitemap at all: robots.txt declares none, and /sitemap.xml,
+        # /sitemapindex.xml and /rest-api/sitemapXml all 404 or 400. Their
+        # A-Ö page lists every topic as a plain HTML link, so the index is
+        # the only source — and therefore the only membership rule.
+        index_urls=["https://kristdemokraterna.se/var-politik/"
+                    "politik-a-till-o"],
+        topic_pattern=re.compile(
+            r"^https://kristdemokraterna\.se/var-politik/politik-a-till-o/"
+            r"[^/]+/?$"),
+        robots_checked="2026-09-09",   # same Sitevision ruleset as S and C
+    ),
+        "L": PartySite(
+        code="L",
+        name="Liberalerna",
+        sitemap="https://www.liberalerna.se/sitemap_index.xml",
+        index_urls=["https://www.liberalerna.se/politik/"],
+        topic_pattern=re.compile(
+            r"^https://www\.liberalerna\.se/politik/[^/]+/?$"),
+        robots_checked="2026-09-09",   # Yoast block, allt tillåtet
+    ),
+    # M, KD, L go here — one entry each, no new code.
 }
 
 
 def slug_of(url):
-    """Last path segment: .../politik/energi/ -> "energi"."""
-    return url.rstrip("/").rsplit("/", 1)[-1]
+    """Filename-safe id from the last path segment."""
+    return url.rstrip("/").rsplit("/", 1)[-1] or "index"
 
 
 def party_codes(argument):
@@ -124,89 +211,179 @@ def party_codes(argument):
 # Discovery
 # --------------------------------------------------------------------------
 
-def locs(xml_bytes, tag):
-    """<loc> values that are children of <tag>, namespace or not.
+def xml_bytes(response):
+    """Sitemap bytes, decompressed and cleaned up enough to parse.
 
-    The tag matters: asked for "sitemap", a plain page sitemap must return
-    nothing. A fallback that returns every <loc> in the document would make
-    a page sitemap look like a sitemap index, and we would then try to fetch
-    all ~100 pages as if each were a child sitemap.
+    Two things get in the way in practice:
+
+    Centerpartiet serves its child sitemap as sitemap1.xml.gz, and requests
+    only decompresses automatically when the server sets Content-Encoding —
+    a .gz file normally arrives as application/x-gzip without it, so check
+    the magic bytes rather than trusting the headers.
+
+    Sverigedemokraterna's Yoast sitemap emits a blank line before the <?xml?>
+    declaration, which ElementTree rejects outright ("XML or text
+    declaration not at start of entity"). A BOM does the same. Neither is
+    valid XML, and neither is worth failing a whole party over.
     """
-    root = ET.fromstring(xml_bytes)
-    found = [e.text.strip()
-             for e in root.findall(f".//sm:{tag}/sm:loc", SITEMAP_NS)
-             if e.text]
-    if found:
-        return found
+    data = response.content
+    if data[:2] == b"\x1f\x8b":
+        data = gzip.decompress(data)
+    if data[:3] == b"\xef\xbb\xbf":              # UTF-8 BOM
+        data = data[3:]
+    data = data.lstrip()
+    if not data.startswith(b"<?xml"):
+        start = data.find(b"<?xml")              # stray output before it
+        if start > 0:
+            data = data[start:]
+    return data
 
-    # Some generators omit the namespace entirely; walk it by local name.
+
+def locs(xml_data, tag):
+    """[(url, lastmod)] for every <loc> under <tag>, namespace or not.
+
+    The tag scoping matters: asked for "sitemap", a plain page sitemap must
+    return nothing. A fallback that returned every <loc> in the document
+    would make a page sitemap look like a sitemap index, and we would then
+    fetch all ~100 pages as if each were a child sitemap.
+
+    lastmod matters because parties publish campaign material from years ago
+    beside current policy, and undated retrieval reports the two alike.
+    """
+    root = ET.fromstring(xml_data)
+
+    def pair(element):
+        url = lastmod = None
+        for child in element:
+            name = child.tag.rsplit("}", 1)[-1]
+            if name == "loc" and child.text:
+                url = child.text.strip()
+            elif name == "lastmod" and child.text:
+                lastmod = child.text.strip()[:10]      # date part only
+        return url, lastmod
+
     out = []
     for element in root.iter():
         if element.tag.rsplit("}", 1)[-1] != tag:
             continue
-        for child in element:
-            if child.tag.rsplit("}", 1)[-1] == "loc" and child.text:
-                out.append(child.text.strip())
+        url, lastmod = pair(element)
+        if url:
+            out.append((url, lastmod))
     return out
 
 
 def from_sitemap(site, session):
-    """URLs from the sitemap, following one level of sitemap index."""
+    """{url: lastmod} from the sitemap, following one level of index."""
     if not site.sitemap:
-        return set()
+        return {}
     try:
         r = session.get(site.sitemap, timeout=30)
         r.raise_for_status()
     except Exception as e:
         print(f"  sitemap unavailable ({e})")
-        return set()
+        return {}
 
-    children = locs(r.content, "sitemap")
+    children = locs(xml_bytes(r), "sitemap")
     if children:
-        urls = set()
-        for child in children:
-            time.sleep(DELAY_SECONDS)
+        found = {}
+        for child_url, _ in children:
+            time.sleep(site.crawl_delay)
             try:
-                cr = session.get(child, timeout=30)
+                cr = session.get(child_url, timeout=30)
                 cr.raise_for_status()
-                urls.update(locs(cr.content, "url"))
+                found.update(dict(locs(xml_bytes(cr), "url")))
             except Exception as e:
-                print(f"  child sitemap {child} failed ({e})")
-        return urls
-    return set(locs(r.content, "url"))
+                print(f"  child sitemap {child_url} failed ({e})")
+        return found
+    return dict(locs(xml_bytes(r), "url"))
 
 
 def from_index(site, session):
-    """URLs linked from the party's own A-Ö index page(s)."""
-    urls = set()
+    """{url: {link labels}} from the party's own A-Ö index page(s).
+
+    The label matters as much as the URL. C lists "Artificiell intelligens,
+    AI" pointing at /digitalisering, and MP lists "Elbilar" pointing at
+    /bilar-och-bransle — the party's own vocabulary for the topic, which a
+    reader is far more likely to type than the slug.
+    """
+    found = {}
     for index_url in site.index_urls:
-        time.sleep(DELAY_SECONDS)
+        time.sleep(site.crawl_delay)
         try:
             r = session.get(index_url, timeout=30)
             r.raise_for_status()
         except Exception as e:
             print(f"  index {index_url} failed ({e})")
             continue
-        soup = BeautifulSoup(r.text, "html.parser")
+        # r.content, not r.text: mp.se sends no charset in its Content-Type,
+        # so requests falls back to ISO-8859-1 per the old HTTP spec and
+        # every å ä ö arrives as mojibake ("Ãldreomsorg"). Given bytes,
+        # BeautifulSoup reads the <meta charset> instead.
+        soup = BeautifulSoup(r.content, "html.parser")
         for a in soup.find_all("a", href=True):
-            urls.add(urljoin(index_url, a["href"].split("#")[0]))
-    return urls
+            url = urljoin(index_url, a["href"].split("#")[0])
+            label = " ".join(a.get_text().split())
+            found.setdefault(url, set())
+            if label:
+                found[url].add(label)
+    return found
 
 
 def discover(site, session, verbose=True):
-    """Topic page URLs, from sitemap and index page together."""
-    sitemap_urls = {u for u in from_sitemap(site, session)
+    """[{url, lastmod, sources, labels}] — the pages to collect, where each
+    came from, and what the party calls it."""
+    sitemap = {u: lm for u, lm in from_sitemap(site, session).items()
+               if site.topic_pattern.search(u)}
+    index_labels = {u: labels
+                    for u, labels in from_index(site, session).items()
                     if site.topic_pattern.search(u)}
-    index_urls = {u for u in from_index(site, session)
-                  if site.topic_pattern.search(u)}
-    both = sorted(sitemap_urls | index_urls)
+    index = set(index_labels)
+
+    if site.index_urls and site.index_only:
+        selected = index                      # the A-Ö register decides
+    else:
+        selected = set(sitemap) | index
+
+    pages = []
+    for url in sorted(selected):
+        sources = []
+        if url in sitemap:
+            sources.append("sitemap")
+        if url in index:
+            sources.append("index")
+        pages.append({"url": url,
+                      "lastmod": sitemap.get(url),
+                      "sources": sources,
+                      "labels": sorted(index_labels.get(url, ()))})
+
     if verbose:
-        print(f"  sitemap: {len(sitemap_urls)}   index page: {len(index_urls)}"
-              f"   union: {len(both)}")
-        only_index = len(index_urls - sitemap_urls)
-        if only_index:
-            print(f"  ({only_index} topics the sitemap does not list)")
-    return both
+        dated = sum(1 for p in pages if p["lastmod"])
+        print(f"  sitemap: {len(sitemap)}   index page: {len(index)}"
+              f"   selected: {len(pages)}   with a date: {dated}")
+        n_labels = sum(len(p["labels"]) for p in pages)
+        if index and n_labels > len(index):
+            print(f"  ({n_labels} index entries for {len(index)} indexed "
+                  f"pages — the rest are aliases)")
+        if site.index_urls and site.index_only:
+            dropped = len(set(sitemap) - index)
+            if dropped:
+                print(f"  ({dropped} sitemap pages not on the A-Ö index, "
+                      f"skipped)")
+        elif index:
+            only_index = len(index - set(sitemap))
+            if only_index:
+                print(f"  ({only_index} not listed in the sitemap)")
+
+    # A JavaScript-driven A-Ö page has no links for BeautifulSoup to find,
+    # so index_only would silently select nothing while the sitemap is full
+    # of perfectly good pages. Several party sites are built this way.
+    if not pages and sitemap:
+        print(f"  WARNING: {len(sitemap)} pages matched the pattern but none "
+              f"were selected. If this party's A-Ö page is JavaScript-driven "
+              f"there are no links to scrape — clear index_urls or leave "
+              f"index_only False and let the path pattern decide.")
+
+    return pages
 
 
 # --------------------------------------------------------------------------
@@ -223,8 +400,11 @@ def show_discovery(party_code):
     """Dry run — check a new party's pattern before fetching anything."""
     site = PARTIES[party_code]
     print(f"{site.name}:")
-    for url in discover(site, session_with_agent()):
-        print(f"    {url}")
+    for page in discover(site, session_with_agent()):
+        marks = "+".join(page["sources"])
+        labels = f"  [{'; '.join(page['labels'])}]" if page["labels"] else ""
+        print(f"    {page['lastmod'] or '----------'}  {marks:14s} "
+              f"{page['url']}{labels}")
 
 
 def fetch(party_code, data_dir=DEFAULT_DATA_DIR):
@@ -236,30 +416,49 @@ def fetch(party_code, data_dir=DEFAULT_DATA_DIR):
 
     session = session_with_agent()
     print(f"{site.name}:")
-    urls = discover(site, session)
+    pages = discover(site, session)
 
     index = []
-    for n, url in enumerate(urls, 1):
+    used = {}
+    for n, page in enumerate(pages, 1):
+        url = page["url"]
         slug = slug_of(url)
+        if used.get(slug, url) != url:
+            # Nested topics can share a final segment (…/klimat/energi and
+            # …/energi). Without this the second page silently overwrites
+            # the first one's HTML file.
+            parent = url.rstrip("/").rsplit("/", 2)[-2]
+            slug = f"{parent}__{slug}"
+        used[slug] = url
+
         path = out_dir / f"{slug}.html"
         if path.exists():
-            print(f"  [{n}/{len(urls)}] {slug} (cached)")
+            print(f"  [{n}/{len(pages)}] {slug} (cached)")
         else:
-            time.sleep(DELAY_SECONDS)
+            time.sleep(site.crawl_delay)
             try:
                 r = session.get(url, timeout=30)
                 r.raise_for_status()
             except Exception as e:
-                print(f"  [{n}/{len(urls)}] {slug} FAILED: {e}")
+                print(f"  [{n}/{len(pages)}] {slug} FAILED: {e}")
                 continue
-            path.write_text(r.text, encoding="utf-8")
-            print(f"  [{n}/{len(urls)}] {slug} ({len(r.text)} bytes)")
-        index.append({"slug": slug, "url": url, "file": path.name})
+            # Bytes, not r.text. When a server declares no charset, requests
+            # decodes as ISO-8859-1 and write_text then re-encodes to UTF-8:
+            # two wrongs that do not cancel, and the file on disk is
+            # permanently double-encoded. Raw data on disk stays raw.
+            path.write_bytes(r.content)
+            print(f"  [{n}/{len(pages)}] {slug} ({len(r.content)} bytes)")
+
+        index.append({"slug": slug, "url": url, "file": path.name,
+                      "lastmod": page["lastmod"], "sources": page["sources"],
+                      "labels": page["labels"]})
 
     (out_dir / "index.json").write_text(
         json.dumps({"party": party_code, "name": site.name,
                     "fetched": date.today().isoformat(),
                     "robots_checked": site.robots_checked,
+                    "crawl_delay": site.crawl_delay,
+                    "index_only": bool(site.index_urls and site.index_only),
                     "pages": index}, ensure_ascii=False, indent=1),
         encoding="utf-8")
     print(f"saved {len(index)} pages to {out_dir}")
@@ -296,9 +495,11 @@ def extract(party_code, data_dir=DEFAULT_DATA_DIR, out_dir=DEFAULT_OUT_DIR):
     out_path = out_dir / f"positions_said_{party_code}.jsonl"
 
     lengths, skipped = [], []
-    with open(out_path, "w", encoding="utf-8") as fh:     # not "a"
+    with open(out_path, "w", encoding="utf-8") as fh:      # not "a"
         for page in meta["pages"]:
-            raw = (in_dir / page["file"]).read_text(encoding="utf-8")
+            # Bytes: trafilatura reads the document's own <meta charset>,
+            # which is more reliable than assuming UTF-8 across five CMSes.
+            raw = (in_dir / page["file"]).read_bytes()
             text = trafilatura.extract(
                 raw,
                 output_format="markdown",
@@ -313,6 +514,13 @@ def extract(party_code, data_dir=DEFAULT_DATA_DIR, out_dir=DEFAULT_OUT_DIR):
             metadata = trafilatura.extract_metadata(raw)
             heading = (metadata.title if metadata and metadata.title
                        else page["slug"].replace("-", " ").capitalize())
+            sources = page.get("sources", [])
+            labels = page.get("labels", [])
+
+            # The aliases go into the embedded text, not only the metadata,
+            # so that "vad tycker C om AI?" can reach a page whose slug and
+            # heading both say "digitalisering".
+            alias_line = f"({'; '.join(labels)})\n" if labels else ""
 
             fh.write(json.dumps({
                 "chunk_id": f"{party_code}:said:{page['slug']}",
@@ -321,9 +529,16 @@ def extract(party_code, data_dir=DEFAULT_DATA_DIR, out_dir=DEFAULT_OUT_DIR):
                 "parti_namn": site.name,
                 "sakfraga": page["slug"],
                 "heading": heading,
+                "labels": labels,
                 "text": text,
+                "text_for_embedding": f"{heading}\n{alias_line}{text}",
                 "url": page["url"],
                 "hamtad": meta["fetched"],
+                # When the party last touched the page. Weight retrieval by
+                # this: a 2021 campaign page is not a current position.
+                "lastmod": page.get("lastmod"),
+                "sources": sources,
+                "in_index": "index" in sources,
                 # Lets a later run detect that a party changed its position
                 # without diffing prose by hand.
                 "content_hash": hashlib.sha256(
