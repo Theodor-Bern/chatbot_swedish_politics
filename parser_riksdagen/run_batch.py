@@ -15,7 +15,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from betankande import (
+from parser_riksdagen.betankande import (
     RESERVATION, DISSENT, SECTION_BY_CLASS,
     read_html, document_kind, parse_document, parse_heading,
     expected_counts, actual_counts, verify,

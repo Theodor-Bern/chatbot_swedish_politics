@@ -19,10 +19,10 @@ from pathlib import Path
 
 import pandas as pd
 
-from betankande import (
+from parser_riksdagen.betankande import (
     RESERVATION, read_html, document_kind, parse_document,
 )
-from votes import load_votes
+from parser_riksdagen.votes import load_votes
 
 
 def collect_reservations(folder):

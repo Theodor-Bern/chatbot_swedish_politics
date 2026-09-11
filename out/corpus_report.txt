@@ -1,0 +1,31 @@
+source:  data/html
+output:  out/chunks.jsonl  (30849 chunks)
+
+files:
+    word          1434
+    empty           34
+    pdfscan         13
+    plaintext        1
+
+chunks per section:
+    reservation   11313
+    decision       8457
+    summary        5655
+    deliberation   4279
+    dissent        1145
+
+checksum against the summary sentence:
+    pass          1426
+    fail          6
+    unverifiable  2
+    accuracy      99.6%
+    coverage      1432/1434 = 99.9%
+
+decision-list reservation refs vs reservation headings:
+    agree 6635/6696 = 99.1%
+
+chunk length: median 641, p90 2517, max 60327
+    over 3000 chars (need splitting): 2175
+
+checksum failures: ha01fiu2.html, ha01fiu35.html, ha01uu14.html, ha01uu15.html, ha01uu17.html, hd01juu26.html
+unverifiable: hb01sku12.html, hd01sou36.html
