@@ -183,7 +183,7 @@ def did_context(d):
     return " — ".join(b for b in bitar if b)
 
 
-def load_records():
+def load_records(motions_path=None):
     """Båda lagren -> en lista av passager med gemensamt schema."""
     poster = []
 
@@ -225,11 +225,28 @@ def load_records():
                 "kontext": ctx,
                 "text": bit,
             })
+    if motions_path:
+        with open(motions_path, encoding="utf-8") as fh:
+            for line in fh:
+                d = json.loads(line)
+                authors = ", ".join(f"{p['namn']} ({p['partibet']})" for p in d['undertecknare'])
+                ctx = (f"Motion {d['rm']}:{d['beteckning']} — {d['heading']} — "
+                       f"{d.get('motionstyp', '')}, inlämnad {d.get('datum', 'okänt')} — "
+                       f"Förslag av {authors}. Inte ett beslut eller belägg för hela partiets stöd.")
+                for i, bit in enumerate(split_text(d['text'])):
+                    poster.append({**d, "id": f"{d['chunk_id']}#{i}",
+                                   "parent": d['chunk_id'], "kontext": ctx, "text": bit})
     return poster
 
 
 def passage_text(p):
     """Det som faktiskt embeddas: kontextraden och sedan texten."""
+    if p['layer'] == 'motion':
+        # Långa namnlistor får inte tränga undan själva förslaget i sökmodellen.
+        # Full avsändarinformation finns kvar i kontexten till Gemini.
+        context = (f"Motion {p['rm']}:{p['beteckning']} — {p['heading']} — "
+                   f"förslag från ledamöter ({p['parti']})")
+        return f"passage: {context}\n{p['text']}"
     return f"passage: {p['kontext']}\n{p['text']}"
 
 
@@ -341,10 +358,25 @@ def encode_query(text, stub=False, model_name=MODEL_NAME):
 # --------------------------------------------------------------------------
 
 def build(stub=False, model_name=MODEL_NAME, out_dir=INDEX_DIR,
-          bara_bm25=False):
+          bara_bm25=False, motions_path=None, base_index=None):
     import numpy as np
 
-    poster = load_records()
+    poster = load_records(motions_path)
+    base = None
+    if base_index:
+        if os.path.realpath(base_index) == os.path.realpath(out_dir):
+            raise ValueError("Basindex och nytt index måste vara olika mappar")
+        base = Index(base_index)
+        if stub or base.stub or base.meta != poster[:len(base.meta)]:
+            raise ValueError("Basindexets texter/ordning matchar inte. Bygg ett nytt index utan --base-index.")
+        model_name = base.info['model']
+    if bara_bm25:
+        meta_path = os.path.join(out_dir, 'meta.jsonl')
+        if not os.path.exists(meta_path):
+            raise ValueError("--bara-bm25 kräver ett befintligt index")
+        previous = [json.loads(line) for line in open(meta_path, encoding='utf-8')]
+        if previous != poster:
+            raise ValueError("Texterna har ändrats: även vektorerna måste byggas om")
     print(f"{len(poster)} passager")
     lager = Counter(p["layer"] for p in poster)
     print("  " + "  ".join(f"{k} {v}" for k, v in sorted(lager.items())))
@@ -363,14 +395,21 @@ def build(stub=False, model_name=MODEL_NAME, out_dir=INDEX_DIR,
         return poster
 
     print("embeddar …")
-    vek = encode([passage_text(p) for p in poster], stub=stub,
-                 model_name=model_name)
+    new = poster[len(base.meta):] if base else poster
+    if not new and base:
+        vek = base.vek
+    else:
+        vek = encode([passage_text(p) for p in new], stub=stub,
+                     model_name=model_name)
+        if base:
+            vek = np.concatenate((base.vek, vek))
     np.save(os.path.join(out_dir, "vectors.npy"), vek)
 
     with open(os.path.join(out_dir, "info.json"), "w", encoding="utf-8") as fh:
         json.dump({"model": "stub" if stub else model_name,
                    "dim": int(vek.shape[1]), "n": len(poster),
-                   "max_chars": MAX_CHARS, "overlap": OVERLAP}, fh,
+                   "max_chars": MAX_CHARS, "overlap": OVERLAP,
+                   "layers": sorted(lager)}, fh,
                   ensure_ascii=False, indent=2)
 
     print(f"\nskrev {out_dir}/  ({vek.shape[0]} × {vek.shape[1]})")
@@ -409,7 +448,7 @@ class Index:
                                    convert_to_numpy=True).astype("float32")[0]
 
     def search(self, fråga, k=8, parti=None, layer=None, per_parti=None,
-               kandidater=300, metod="hybrid", vikt_bm25=None):
+               kandidater=300, metod="hybrid", vikt_bm25=None, rm=None):
         """metod: 'hybrid' (BM25 + vektor), 'bm25' eller 'vektor'.
 
         De två rena lägena finns för ablationen i rapporten — och 'bm25'
@@ -419,17 +458,24 @@ class Index:
         import numpy as np
 
         w_bm = RRF_VIKT_BM25 if vikt_bm25 is None else vikt_bm25
+        allowed = {i for i, m in enumerate(self.meta)
+                   if (not layer or m['layer'] == layer)
+                   and (not rm or m.get('rm') == rm)
+                   and (not parti or set(m.get('parti', '').split(';')) & set(parti))}
+        if not allowed:
+            return []
         listor = []
         if metod in ("hybrid", "bm25"):
             listor.append((1.0 if metod == "bm25" else w_bm,
-                           self.bm.search(fråga, limit=kandidater,
-                                          ta_bort_partinamn=bool(parti))))
+                           [(i, score) for i, score in self.bm.search(
+                               fråga, limit=len(self.meta), ta_bort_partinamn=bool(parti))
+                            if i in allowed][:kandidater]))
         if metod in ("hybrid", "vektor"):
             qv = self._encode_query(fråga)
             sim = self.vek @ qv
             listor.append((RRF_VIKT_VEKTOR,
                            [(int(i), float(sim[i]))
-                            for i in np.argsort(-sim)[:kandidater]]))
+                            for i in np.argsort(-sim) if int(i) in allowed][:kandidater]))
 
         # Reciprocal Rank Fusion: rangordning slås ihop utan att vi behöver
         # normalisera två helt olika poängskalor mot varandra.
@@ -490,6 +536,8 @@ def main():
                    help="rökttest med fejk-encoder, ingen modell laddas")
     b.add_argument("--model", default=MODEL_NAME)
     b.add_argument("--out", default=INDEX_DIR)
+    b.add_argument("--motions", help="Bearbetade motioner, t.ex. out/motions.jsonl")
+    b.add_argument("--base-index", help="Återanvänd oförändrade basvektorer i ett separat nytt index")
     b.add_argument("--bara-bm25", action="store_true",
                    help="bygg om meta + BM25 utan att röra vectors.npy")
 
@@ -497,7 +545,8 @@ def main():
     s.add_argument("fraga")
     s.add_argument("-k", type=int, default=8)
     s.add_argument("--parti", default="", help="t.ex. V,SD")
-    s.add_argument("--layer", choices=["said", "did"])
+    s.add_argument("--layer", choices=["said", "did", "motion"])
+    s.add_argument("--rm", help="Avgränsa till ett riksmöte, t.ex. 2023/24")
     s.add_argument("--per-parti", type=int, default=None,
                    help="max antal träffar per parti")
     s.add_argument("--index", default=INDEX_DIR)
@@ -512,7 +561,7 @@ def main():
     a = ap.parse_args()
     if a.cmd == "build":
         build(stub=a.stub, model_name=a.model, out_dir=a.out,
-              bara_bm25=a.bara_bm25)
+              bara_bm25=a.bara_bm25, motions_path=a.motions, base_index=a.base_index)
     elif a.cmd == "shell":
         idx = Index(a.index)
         print(f"{idx.info['n']} passager, modell {idx.info['model']}. "
@@ -530,7 +579,7 @@ def main():
         partier = [p.strip().upper() for p in a.parti.split(",") if p.strip()]
         visa(idx.search(a.fraga, k=a.k, parti=partier or None,
                         layer=a.layer, per_parti=a.per_parti, metod=a.metod,
-                        vikt_bm25=a.vikt_bm25))
+                        vikt_bm25=a.vikt_bm25, rm=a.rm))
 
 
 if __name__ == "__main__":

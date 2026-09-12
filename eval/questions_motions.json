@@ -1,0 +1,160 @@
+[
+  {
+    "id": "M01",
+    "typ": "motion",
+    "fraga": "Vilka motioner har MP lämnat om avtalet med Chile 2023/24?",
+    "sok": {
+      "parti": [
+        "MP"
+      ],
+      "layer": "motion",
+      "rm": "2023/24",
+      "k": 10
+    },
+    "relevant": {
+      "layer": "motion",
+      "dok_id": [
+        "HB022904"
+      ]
+    },
+    "kommentar": "Källgranskat positivt exempel, två undertecknare. Inte ett fullständigt facit över alla motioner om Chile."
+  },
+  {
+    "id": "M02",
+    "typ": "motion",
+    "fraga": "Vilka motioner har C lämnat om tillfälligt skydd 2023/24?",
+    "sok": {
+      "parti": [
+        "C"
+      ],
+      "layer": "motion",
+      "rm": "2023/24",
+      "k": 10
+    },
+    "relevant": {
+      "layer": "motion",
+      "dok_id": [
+        "HB022922"
+      ]
+    },
+    "kommentar": "Känd motion med tre undertecknare. Ett sökexempel, inte ett heltäckande ämnesfacit."
+  },
+  {
+    "id": "M03",
+    "typ": "motion",
+    "fraga": "Vilka motioner lade MP om säkra cykelvägar för barn 2022/23?",
+    "sok": {
+      "parti": [
+        "MP"
+      ],
+      "layer": "motion",
+      "rm": "2022/23",
+      "k": 10
+    },
+    "relevant": {
+      "layer": "motion",
+      "dok_id": [
+        "HA022105"
+      ]
+    },
+    "kommentar": "Positivt exempel kontrollerat mot motionens förslagstext. Inte ett heltäckande ämnesfacit."
+  },
+  {
+    "id": "M04",
+    "typ": "motion",
+    "fraga": "Vilka motioner lade C om en metro över Öresund 2022/23?",
+    "sok": {
+      "parti": [
+        "C"
+      ],
+      "layer": "motion",
+      "rm": "2022/23",
+      "k": 10
+    },
+    "relevant": {
+      "layer": "motion",
+      "dok_id": [
+        "HA021611"
+      ]
+    },
+    "kommentar": "Positivt exempel kontrollerat mot motionens förslagstext. Inte ett heltäckande ämnesfacit."
+  },
+  {
+    "id": "M05",
+    "typ": "motion",
+    "fraga": "Vilka motioner lade V för att trygga Allmänna arvsfondens arbete 2024/25?",
+    "sok": {
+      "parti": [
+        "V"
+      ],
+      "layer": "motion",
+      "rm": "2024/25",
+      "k": 10
+    },
+    "relevant": {
+      "layer": "motion",
+      "dok_id": [
+        "HC02330"
+      ]
+    },
+    "kommentar": "Positivt exempel kontrollerat mot motionens förslagstext. Inte ett heltäckande ämnesfacit."
+  },
+  {
+    "id": "M06",
+    "typ": "motion",
+    "fraga": "Vilka motioner lade S om tillträde till universitet och högskolor 2024/25?",
+    "sok": {
+      "parti": [
+        "S"
+      ],
+      "layer": "motion",
+      "rm": "2024/25",
+      "k": 10
+    },
+    "relevant": {
+      "layer": "motion",
+      "dok_id": [
+        "HC02938"
+      ]
+    },
+    "kommentar": "Positivt exempel kontrollerat mot motionens förslagstext. Inte ett heltäckande ämnesfacit."
+  },
+  {
+    "id": "M07",
+    "typ": "motion",
+    "fraga": "Vilka motioner lade S om sanering av gifttunnor i Sundsvallsbukten 2025/26?",
+    "sok": {
+      "parti": [
+        "S"
+      ],
+      "layer": "motion",
+      "rm": "2025/26",
+      "k": 10
+    },
+    "relevant": {
+      "layer": "motion",
+      "dok_id": [
+        "HD02652"
+      ]
+    },
+    "kommentar": "Positivt exempel kontrollerat mot motionens förslagstext. Inte ett heltäckande ämnesfacit."
+  },
+  {
+    "id": "M08",
+    "typ": "motion",
+    "fraga": "Vilka motioner lade flera partier om tillgänglighet i riksdagens lokaler 2025/26?",
+    "sok": {
+      "parti": null,
+      "layer": "motion",
+      "rm": "2025/26",
+      "k": 10
+    },
+    "relevant": {
+      "layer": "motion",
+      "dok_id": [
+        "HD023534"
+      ]
+    },
+    "kommentar": "Positivt exempel kontrollerat mot motionens förslagstext. Inte ett heltäckande ämnesfacit."
+  }
+]

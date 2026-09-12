@@ -316,20 +316,45 @@ def _mening(parti, v, info):
     return s
 
 
+def _motivmening(parti, v, info, var):
+    """Beskriv motivfrågan utan att göra avstående till motstånd."""
+    var = f"{var} den {v['datum']}"
+    antal = [info['ja'], info['nej'], info['avstod']]
+    if sum(n > 0 for n in antal) > 1:
+        text = f"Ledamöterna från {parti} röstade olika i motivfrågan på {var}."
+    elif info['stance'] == 'Nej':
+        text = f"{parti} röstade för en motivreservation på {var}."
+    elif info['stance'] == 'Ja':
+        text = f"{parti} röstade med utskottets förslag mot en motivreservation på {var}."
+    elif info['stance'] == 'Avstår':
+        text = f"{parti} avstod i omröstningen om en motivreservation på {var}."
+    elif info['stance'] == 'Frånvarande':
+        text = f"{parti} var frånvarande i omröstningen om en motivreservation på {var}."
+    else:
+        text = f"Röstläget för {parti} är okänt i motivfrågan på {var}."
+    text += (f" Röstfördelning för {parti}: {info['ja']} ja, {info['nej']} nej, "
+             f"{info['avstod']} avstod och {info['franvarande']} frånvarande. "
+             "Ja stödde utskottets förslag och nej stödde motivreservationen; "
+             "avstående är varken stöd eller motstånd. "
+             "Omröstningen gällde motiveringen, inte sakfrågan.")
+    return text
+
+
 def describe(row, parti):
     """Klartext om vad ett parti gjorde på en punkt.
 
-    Returnerar {'status', 'text', 'egna_reservationer'}. "Ingen votering hölls"
-    är ett fullvärdigt svar, inte ett fel — omkring två tredjedelar av
-    punkterna avgörs med acklamation.
+    Returnerar {'status', 'text', 'egna_reservationer'}.
+    no_vote betyder att voteringsuppgift saknas i vårt underlag, inte att
+    acklamation eller frånvaro av ett beslut har verifierats.
     """
     namn = PARTY_NAMES.get(parti, parti)
     var = f"{row['beteckning']} ({row['rm']}) punkt {row['punkt']}"
     egna = [r["number"] for r in row["reservationer"] if parti in r["partier"]]
 
     if row["status"] == "no_vote":
-        text = (f"Ingen votering hölls på {var}; ärendet avgjordes med acklamation. "
-                f"{namn} tog därför inte ställning i en omröstning.")
+        text = (f"Voteringsuppgift saknas i underlaget för {var}. "
+                f"Det går därför inte att avgöra hur {namn} röstade, "
+                "om punkten avgjordes med acklamation eller vilket beslut som fattades.")
         if egna:
             text += (f" Partiet hade dock reservation "
                      f"{', '.join(str(n) for n in egna)} på punkten.")
@@ -349,11 +374,7 @@ def describe(row, parti):
             )
             continue
         if v["avser"] == "motivfrågan":
-            meningar.append(
-                f"{parti} {'röstade för' if info['stance'] == 'Nej' else 'röstade mot'} "
-                f"en motivreservation på {var} (omröstningen gällde motiveringen, "
-                f"inte sakfrågan)."
-            )
+            meningar.append(_motivmening(parti, v, info, var))
             continue
         if v["reservation"] is not None:
             prövade.add(v["reservation"])
@@ -361,7 +382,8 @@ def describe(row, parti):
 
     if not meningar:
         return {"status": "no_vote",
-                "text": f"{namn} deltog inte i någon omröstning på {var}.",
+                "text": f"Röstuppgift för {namn} saknas i underlaget för {var}; "
+                        "det visar inte att partiet avstod eller inte deltog.",
                 "egna_reservationer": egna}
 
     orörda = [n for n in egna if n not in prövade]
@@ -401,7 +423,7 @@ def cmd_build():
     tot = stats["exact"] + stats["partial"] + stats["unknown"]
     print(f"skrev {OUT}  ({len(rows)} punkter)")
     print(f"  med votering   {stats['punkter_voted']}")
-    print(f"  acklamation    {stats['punkter_no_vote']}")
+    print(f"  utan voteringsuppgift i underlaget    {stats['punkter_no_vote']}")
     print(f"\nsakfrågevoteringar inom korpusen: {tot}")
     for k in ("exact", "partial", "unknown"):
         n = stats[k]

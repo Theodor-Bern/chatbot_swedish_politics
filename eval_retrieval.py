@@ -52,6 +52,8 @@ def är_relevant(träff, regel):
         return False
     if regel.get("rm") and träff.get("rm") not in regel["rm"]:
         return False
+    if regel.get("dok_id") and träff.get("dok_id") not in regel["dok_id"]:
+        return False
     if regel.get("utskott"):
         # Utskottskoderna är blandade versaler (JuU, SfU, MJU) eftersom de
         # kommer från beteckningens prefix. Jämför skiftlägesokänsligt.
@@ -79,6 +81,7 @@ def kör_fråga(idx, q, metod, vikt_bm25=None):
         per_parti=sok.get("per_parti"),
         metod=metod,
         vikt_bm25=vikt_bm25,
+        rm=sok.get("rm"),
     )
     metas = [m for _poäng, m in träffar]
     flaggor = [är_relevant(m, q.get("relevant")) for m in metas]
