@@ -15,8 +15,8 @@ python3 -m pip install numpy sentence-transformers google-genai requests
 För befintlig insamling/bearbetning av partisidor och betänkanden behövs också
 `beautifulsoup4`, `trafilatura` och för vissa analysprogram `pandas`.
 
-Data och index följer inte med Git. För kompisens färdiga basversion behövs
-`out/index/{info.json,meta.jsonl,vectors.npy,bm25.pkl}` från **samma bygge**.
+Data och sökindex ingår inte i repot. För att använda ett färdigbyggt index behövs filerna info.json, meta.jsonl, vectors.npy och bm25.pkl i mappen out/index/. Filerna måste komma från samma indexbygge för att fungera tillsammans.
+
 `out/positions_did.jsonl` behövs för röstuppgifter. För att bygga motionsindexet
 nedan behövs dessutom `out/chunks.jsonl` och `out/positions_said_*.jsonl`.
 
