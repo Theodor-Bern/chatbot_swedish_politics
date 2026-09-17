@@ -17,6 +17,8 @@ ordöverlapp: vilken sektion delar flest ovanliga ord med yrkandet.
 Kör:
     python -m parser_riksdagen.motion inspect data/motioner/2022_23_1.html
     python -m parser_riksdagen.motion build data/motioner out/motion_chunks.jsonl
+    python -m parser_riksdagen.motion embed out/motion_chunks.jsonl out/motion_index
+    python -m parser_riksdagen.motion embed out/motion_chunks.jsonl out/motion_index --stub
 """
 
 from __future__ import annotations
@@ -45,7 +47,18 @@ RUBRIK_CLASSES = {"Rubrik1numrerat", "Rubrik2numrerat", "Rubrik3numrerat", "Rubr
 # i stället för <p class="RubrikXnumrerat"> — samma roll, annan markup.
 HEADING_TAGS = ["h1", "h2", "h3", "h4", "h5", "h6"]
 
+PARTY_NAMES = {
+    "S": "Socialdemokraterna", "M": "Moderaterna", "SD": "Sverigedemokraterna",
+    "C": "Centerpartiet", "V": "Vänsterpartiet", "KD": "Kristdemokraterna",
+    "MP": "Miljöpartiet", "L": "Liberalerna",
+}
+
+MODEL_NAME = "intfloat/multilingual-e5-large"
+EMBED_BATCH = 32
+
 BETECKNING_RE = re.compile(r"^(?P<rm>\d{4}/\d{2}):(?P<nr>\S+)")
+# "(V)" — vanligast. "(båda C)"/"(alla S)" — när flera medundertecknare
+# delar samma parti skriver Riksdagen ut det i klartext före partikoden.
 PARTY_RE = re.compile(r"\((?:[a-zåäö]+\s+)?([A-ZÅÄÖ]{1,3})\)\s*$")
 
 WORD_RE = re.compile(r"[a-zåäöA-ZÅÄÖ0-9]+")
@@ -143,9 +156,7 @@ def extract_sections(soup):
     markerar samma sak — var brödtexten hör hemma — bara med olika markup.
 
     <li> hoppas över: de hör till yrkande-listan, inte till en sektions
-    brödtext, även om de råkar ligga inuti Section1. Samma för fristående
-    <p class="Frslagstext"> (nyare exportvariant utan <ol>/<li> alls) —
-    annars hade ett yrkandes egen text kunnat räknas som sin egen kontext.
+    brödtext, även om de råkar ligga inuti Section1.
     """
     section1 = soup.find("div", class_="Section1")
     if section1 is None:
@@ -253,6 +264,41 @@ class Chunk:
         return d
 
 
+# Den vanligaste yrkande-mallen, isolerad så vi kan klippa bort den ur det
+# som embeddas (INTE ur chunk.text — LLM:en ska fortfarande få hela,
+# korrekta meningen). Matchar inte mallen (t.ex. "Riksdagen avslår
+# proposition X …") -> hela texten används oförändrad. Hellre det än att
+# gissa och klippa fel.
+YRKANDE_WRAPPER_RE = re.compile(
+    r"^Riksdagen ställer sig bakom det som anförs i motionen om (att )?"
+    r"(?P<kärna>.+?)"
+    r"[,.]?\s*och\s+(detta\s+tillkännager\s+riksdagen|tillkännager\s+detta)\s+för\s+regeringen\.?\s*$",
+    re.IGNORECASE)
+
+
+def yrkande_kärna(text):
+    m = YRKANDE_WRAPPER_RE.match(text)
+    return m.group("kärna").strip() if m else text
+
+
+def passage_text(chunk):
+    """Det som faktiskt embeddas: en kontextrad, sedan yrkandets kärna.
+
+    Nästan alla yrkanden delar samma malltext ("Riksdagen ställer sig
+    bakom det som anförs i motionen om att ... och tillkännager detta för
+    regeringen") — den mallen konkurrerar om utrymme i embeddingen med
+    tiotusentals andra chunkar. Två åtgärder mot det: kontextraden sätter
+    parti och ämne FÖRE texten (samma "wordalisation"-princip som
+    rag_index.py använder för betänkanden), och yrkande_kärna() klipper
+    bort själva mallfrasen där den känns igen.
+    """
+    namn = PARTY_NAMES.get(chunk.parti, chunk.parti)
+    kontext = f"{namn} ({chunk.parti}), motion {chunk.beteckning} {chunk.rm}"
+    if chunk.heading:
+        kontext += f", om {chunk.heading}"
+    return f"passage: {kontext}\n{yrkande_kärna(chunk.text)}"
+
+
 def parse_motion(path):
     """En HTML-fil -> lista av Chunk, ett per yrkande i dokumentet."""
     soup = BeautifulSoup(read_html(path), "html.parser")
@@ -324,6 +370,73 @@ def build(html_folder, out_path):
 
 
 # --------------------------------------------------------------------------
+# embed — chunkar -> vektorer
+# --------------------------------------------------------------------------
+
+def stub_vectors(texts, dim=256):
+    """Deterministisk fejk-encoder för rökttest — INTE semantisk, bara ett
+    sätt att bevisa att hela kedjan (läsa, bygga passage, spara vektorer)
+    fungerar innan man väntar på att en 2 GB-modell laddas ner."""
+    import numpy as np
+    v = np.zeros((len(texts), dim), dtype="float32")
+    for i, t in enumerate(texts):
+        for tok in tokenize(t):
+            v[i, hash(tok) % dim] += 1.0
+    n = np.linalg.norm(v, axis=1, keepdims=True)
+    return v / np.maximum(n, 1e-9)
+
+
+def encode(texts, stub=False, model_name=MODEL_NAME):
+    if stub:
+        return stub_vectors(texts)
+    from sentence_transformers import SentenceTransformer
+    print(f"laddar {model_name} …")
+    modell = SentenceTransformer(model_name)
+    modell.max_seq_length = 384
+    return modell.encode(
+        texts, batch_size=EMBED_BATCH, normalize_embeddings=True,
+        show_progress_bar=True, convert_to_numpy=True,
+    ).astype("float32")
+
+
+def embed(chunks_path, out_dir, stub=False, model_name=MODEL_NAME):
+    """Läs motion_chunks.jsonl, bygg en passage per chunk, embedda, spara.
+
+    Skriver tre filer i out_dir:
+      vectors.npy   en rad per chunk, samma ordning som meta.jsonl
+      meta.jsonl    samma chunkar som lästes in — det man slår upp träffar i
+      info.json     vilken modell, hur många chunkar, för att inte blanda
+                    ihop index byggda med olika modeller av misstag
+    """
+    import numpy as np
+
+    chunks_path = Path(chunks_path)
+    rows = [json.loads(line) for line in open(chunks_path, encoding="utf-8")]
+    print(f"{len(rows)} chunkar inlästa från {chunks_path}")
+
+    passages = [passage_text(Chunk(**{k: v for k, v in r.items()
+                                      if k in Chunk.__dataclass_fields__}))
+                for r in rows]
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(out_dir / "meta.jsonl", "w", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    vek = encode(passages, stub=stub, model_name=model_name)
+    np.save(out_dir / "vectors.npy", vek)
+
+    with open(out_dir / "info.json", "w", encoding="utf-8") as fh:
+        json.dump({"model": "stub" if stub else model_name,
+                   "dim": int(vek.shape[1]), "n": len(rows)},
+                  fh, ensure_ascii=False, indent=2)
+
+    print(f"skrev {out_dir}/  ({vek.shape[0]} × {vek.shape[1]})")
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -360,6 +473,11 @@ def main():
         if len(sys.argv) != 4:
             sys.exit(__doc__)
         build(sys.argv[2], sys.argv[3])
+    elif cmd == "embed":
+        if len(sys.argv) not in (4, 5):
+            sys.exit(__doc__)
+        stub = len(sys.argv) == 5 and sys.argv[4] == "--stub"
+        embed(sys.argv[2], sys.argv[3], stub=stub)
     else:
         sys.exit(__doc__)
 
