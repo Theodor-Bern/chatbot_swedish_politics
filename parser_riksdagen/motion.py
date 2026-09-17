@@ -15,16 +15,26 @@ sektion — bara att texten återupprepas. Vi hittar kopplingen genom
 ordöverlapp: vilken sektion delar flest ovanliga ord med yrkandet.
 
 Kör:
-    python -m parser_riksdagen.motion data/motioner/2022_23_1.html
+    python -m parser_riksdagen.motion inspect data/motioner/2022_23_1.html
+    python -m parser_riksdagen.motion build data/motioner out/motion_chunks.jsonl
 """
 
 from __future__ import annotations
 
+import json
 import re
 import sys
+from collections import Counter
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from bs4 import BeautifulSoup
+
+# Under denna gräns litar vi inte på ordöverlapps-matchningen — bättre att
+# spara yrkandet utan sektion än att gissa fel. Satt löst utifrån två
+# motioner (rätta matchningar låg på 85-96%, en observerad felmatchning på
+# 33%) — höj/sänk när fler motioner har testats.
+MIN_MATCH = 0.5
 
 # .Frslagstext, .Hemstlatt och .Yrkande delar bara CSS-formatering i Aspose-
 # exporten (se <style>-blocket) — inget som säger att de är samma sak
@@ -175,14 +185,110 @@ def best_match(yrkande, sections):
 
 
 # --------------------------------------------------------------------------
-# CLI: kör och skriv ut vad vi hittar
+# chunk — det som faktiskt sparas
 # --------------------------------------------------------------------------
 
-def main():
-    if len(sys.argv) != 2:
-        sys.exit(__doc__)
+@dataclass
+class Chunk:
+    """En chunk = ett yrkande, med sin matchade sektion som kontext."""
 
-    path = Path(sys.argv[1])
+    text: str = ""                # yrkandet, helt och ofiltrerat — det som embeddas
+    heading: str = ""              # rubriken på den matchade sektionen
+    sektion_text: str = ""         # sektionens brödtext — kontext, inte embeddat direkt
+    match_score: float = 0.0       # ordöverlappet som avgjorde matchningen (se MIN_MATCH)
+    yrkande_nr: int = 0
+
+    parti: str = ""
+    rm: str = ""
+    beteckning: str = ""
+    doc_title: str = ""
+    forste_undertecknare: str = ""
+    undertecknare: list = field(default_factory=list)
+    layer: str = "motion"          # eget lager — varken SAID eller DID, se resonemanget i chatten
+
+    @property
+    def chunk_id(self):
+        return f"{self.rm}:{self.beteckning}:yrkande:{self.yrkande_nr}"
+
+    def to_dict(self):
+        d = asdict(self)
+        d["chunk_id"] = self.chunk_id
+        d["undertecknare"] = ";".join(self.undertecknare)
+        return d
+
+
+def parse_motion(path):
+    """En HTML-fil -> lista av Chunk, ett per yrkande i dokumentet."""
+    soup = BeautifulSoup(read_html(path), "html.parser")
+
+    info = document_info(soup)
+    signatories = extract_signatories(soup)
+    yrkanden = extract_yrkanden(soup)
+    sections = extract_sections(soup)
+
+    chunks = []
+    for n, yrkande in enumerate(yrkanden, 1):
+        i, score = best_match(yrkande, sections)
+        confident = i is not None and score >= MIN_MATCH
+        chunks.append(Chunk(
+            text=yrkande,
+            heading=sections[i]["heading"] if confident else "",
+            sektion_text=" ".join(sections[i]["body"]) if confident else "",
+            match_score=score,
+            yrkande_nr=n,
+            parti=info["parti"],
+            rm=info["rm"],
+            beteckning=info["beteckning"],
+            doc_title=info["doc_title"],
+            forste_undertecknare=info["forste_undertecknare"],
+            undertecknare=signatories,
+        ))
+    return chunks
+
+
+# --------------------------------------------------------------------------
+# build — kör mot en hel mapp av motioner
+# --------------------------------------------------------------------------
+
+def build(html_folder, out_path):
+    files = sorted(Path(html_folder).glob("*.html"))
+    if not files:
+        sys.exit(f"hittar inga .html-filer i {html_folder}")
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    written = 0
+    osaker = 0
+    crashed = []
+    per_parti = Counter()
+
+    with open(out_path, "w", encoding="utf-8") as fh:
+        for path in files:
+            try:
+                chunks = parse_motion(path)
+            except Exception as e:
+                crashed.append((path.name, repr(e)))
+                continue
+            for c in chunks:
+                fh.write(json.dumps(c.to_dict(), ensure_ascii=False) + "\n")
+                written += 1
+                per_parti[c.parti] += 1
+                if c.match_score < MIN_MATCH:
+                    osaker += 1
+
+    print(f"läste {len(files)} filer, skrev {written} chunkar till {out_path}")
+    print("  per parti: " + "  ".join(f"{p} {n}" for p, n in per_parti.most_common()))
+    print(f"  utan säker sektionsmatchning (< {MIN_MATCH:.0%}): {osaker}/{written}")
+    if crashed:
+        print(f"  KRASCHADE ({len(crashed)}): {crashed}")
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def inspect(path):
     soup = BeautifulSoup(read_html(path), "html.parser")
 
     info = document_info(soup)
@@ -202,6 +308,21 @@ def main():
         match = f"[{score:.0%}] {sections[i]['heading']}" if i is not None else "INGEN MATCH"
         print(f"{n}. {yrkande[:90]}...")
         print(f"   -> {match}\n")
+
+
+def main():
+    if len(sys.argv) < 3:
+        sys.exit(__doc__)
+
+    cmd = sys.argv[1]
+    if cmd == "inspect":
+        inspect(Path(sys.argv[2]))
+    elif cmd == "build":
+        if len(sys.argv) != 4:
+            sys.exit(__doc__)
+        build(sys.argv[2], sys.argv[3])
+    else:
+        sys.exit(__doc__)
 
 
 if __name__ == "__main__":
