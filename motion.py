@@ -19,14 +19,24 @@ Kör:
     python -m parser_riksdagen.motion build data/motioner out/motion_chunks.jsonl
     python -m parser_riksdagen.motion embed out/motion_chunks.jsonl out/motion_index
     python -m parser_riksdagen.motion embed out/motion_chunks.jsonl out/motion_index --stub
+    python -m parser_riksdagen.motion search out/motion_index "vad vill V göra åt kärnkraft?"
+    python -m parser_riksdagen.motion shell out/motion_index
+    python -m parser_riksdagen.motion fraga out/motion_index "vad vill V göra åt kärnkraft?"
+    python -m parser_riksdagen.motion fraga out/motion_index "..." --torrkor
+    python -m parser_riksdagen.motion chatt out/motion_index
+
+Kräver en nyckel från Google AI Studio för fraga/chatt (inte för --torrkor):
+    export GEMINI_API_KEY=...        # lägg ALDRIG nyckeln i repot
 """
 
 from __future__ import annotations
 
 import json
+import math
+import pickle
 import re
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -52,6 +62,37 @@ PARTY_NAMES = {
     "C": "Centerpartiet", "V": "Vänsterpartiet", "KD": "Kristdemokraterna",
     "MP": "Miljöpartiet", "L": "Liberalerna",
 }
+
+# Parameterutvinning: fritext -> partikod. Samma tabell och princip som
+# answer.py i huvudrepot — deterministisk uppslagning i stället för att
+# hoppas att embeddingen/BM25 gissar rätt parti från frågetexten. Vi har
+# tre gånger sett att den gissningen är opålitlig (kärnkraft->M,
+# invandring->SD, skola->V/C, trots frågor riktade mot ett annat parti).
+ALIAS = {
+    "s": "S", "socialdemokraterna": "S", "socialdemokraterna s": "S",
+    "sossarna": "S", "socialdemokratiska arbetarepartiet": "S",
+    "m": "M", "moderaterna": "M", "moderata samlingspartiet": "M",
+    "sd": "SD", "sverigedemokraterna": "SD",
+    "c": "C", "centerpartiet": "C", "centern": "C",
+    "v": "V", "vänsterpartiet": "V", "vansterpartiet": "V",
+    "kd": "KD", "kristdemokraterna": "KD",
+    "mp": "MP", "miljöpartiet": "MP", "miljopartiet": "MP",
+    "de gröna": "MP", "l": "L", "liberalerna": "L", "folkpartiet": "L",
+}
+
+
+def parti_i_fragan(fråga):
+    """Vilka partier nämns i frågan? Tom lista = inget nämnt (sök brett)."""
+    text = f" {fråga.lower()} "
+    funna = []
+    for alias in sorted(ALIAS, key=len, reverse=True):
+        möns = r"\b" + re.escape(alias) + r"\b"
+        if re.search(möns, text):
+            kod = ALIAS[alias]
+            if kod not in funna:
+                funna.append(kod)
+    return funna
+
 
 MODEL_NAME = "intfloat/multilingual-e5-large"
 EMBED_BATCH = 32
@@ -207,9 +248,15 @@ def stam(ord_):
     return ord_
 
 
-def tokenize(text):
+def tokenize_list(text):
+    """Som tokenize(), men en lista — BM25 behöver antal förekomster per
+    ord (termfrekvens), inte bara vilka ord som finns."""
     words = (w.lower() for w in WORD_RE.findall(text))
-    return {stam(w) for w in words if w not in STOPP and len(w) > 2}
+    return [stam(w) for w in words if w not in STOPP and len(w) > 2]
+
+
+def tokenize(text):
+    return set(tokenize_list(text))
 
 
 def best_match(yrkande, sections):
@@ -229,6 +276,58 @@ def best_match(yrkande, sections):
         if score > best_score:
             best_i, best_score = i, score
     return best_i, best_score
+
+
+# --------------------------------------------------------------------------
+# BM25 — exakt ordmatchning, kompletterar vektorsökningen
+# --------------------------------------------------------------------------
+
+class BM25:
+    """Standard BM25 med inverterat index. Ren stdlib, samma implementation
+    som rag_index.py använder för betänkanden — se den för mer utförliga
+    kommentarer om varje del av formeln."""
+
+    def __init__(self, docs, k1=1.5, b=0.75):
+        self.k1, self.b = k1, b
+        self.N = len(docs)
+        self.längder = [len(d) for d in docs]
+        self.medel = sum(self.längder) / self.N if self.N else 0.0
+        self.inv = defaultdict(list)          # term -> [(doc_idx, tf), ...]
+        df = Counter()
+        for i, d in enumerate(docs):
+            for term, tf in Counter(d).items():
+                self.inv[term].append((i, tf))
+                df[term] += 1
+        self.idf = {
+            t: math.log(1 + (self.N - n + 0.5) / (n + 0.5)) for t, n in df.items()
+        }
+
+    def save(self, path):
+        with open(path, "wb") as fh:
+            pickle.dump({"k1": self.k1, "b": self.b, "N": self.N,
+                         "längder": self.längder, "medel": self.medel,
+                         "inv": dict(self.inv), "idf": self.idf},
+                        fh, protocol=4)
+
+    @classmethod
+    def load(cls, path):
+        d = pickle.load(open(path, "rb"))
+        o = cls.__new__(cls)
+        o.k1, o.b, o.N = d["k1"], d["b"], d["N"]
+        o.längder, o.medel = d["längder"], d["medel"]
+        o.inv, o.idf = d["inv"], d["idf"]
+        return o
+
+    def search(self, query, limit=300):
+        poäng = defaultdict(float)
+        for term in tokenize_list(query):
+            idf = self.idf.get(term)
+            if idf is None:
+                continue
+            for i, tf in self.inv.get(term, ()):
+                norm = 1 - self.b + self.b * self.längder[i] / self.medel
+                poäng[i] += idf * tf * (self.k1 + 1) / (tf + self.k1 * norm)
+        return sorted(poäng.items(), key=lambda kv: -kv[1])[:limit]
 
 
 # --------------------------------------------------------------------------
@@ -264,39 +363,55 @@ class Chunk:
         return d
 
 
-# Den vanligaste yrkande-mallen, isolerad så vi kan klippa bort den ur det
-# som embeddas (INTE ur chunk.text — LLM:en ska fortfarande få hela,
-# korrekta meningen). Matchar inte mallen (t.ex. "Riksdagen avslår
-# proposition X …") -> hela texten används oförändrad. Hellre det än att
-# gissa och klippa fel.
-YRKANDE_WRAPPER_RE = re.compile(
-    r"^Riksdagen ställer sig bakom det som anförs i motionen om (att )?"
-    r"(?P<kärna>.+?)"
-    r"[,.]?\s*och\s+(detta\s+tillkännager\s+riksdagen|tillkännager\s+detta)\s+för\s+regeringen\.?\s*$",
-    re.IGNORECASE)
+# Kända yrkande-mallar, isolerade så vi kan klippa bort dem ur det som
+# embeddas (INTE ur chunk.text — LLM:en ska fortfarande få hela, korrekta
+# meningen). Fler mallar läggs till här när vi hittar dem i riktiga
+# chunkar. Matchar ingen av dem -> hela texten används oförändrad. Hellre
+# det än att gissa och klippa fel.
+YRKANDE_WRAPPER_PATTERNS = [
+    re.compile(
+        r"^Riksdagen ställer sig bakom det som anförs i motionen om (att )?"
+        r"(?P<kärna>.+?)"
+        r"[,.]?\s*och\s+(detta\s+tillkännager\s+riksdagen|tillkännager\s+detta)\s+för\s+regeringen\.?\s*$",
+        re.IGNORECASE),
+    # Avslagsyrkanden: "avseende X." eller "i den del som avser X." — ingen
+    # avslutande "och tillkännager"-svans, meningen tar bara slut efter X.
+    re.compile(
+        r"^Riksdagen avslår regeringens förslag\s+"
+        r"(avseende|i\s+den\s+del\s+som\s+avser)\s+"
+        r"(?P<kärna>.+?)\.?\s*$",
+        re.IGNORECASE),
+]
 
 
 def yrkande_kärna(text):
-    m = YRKANDE_WRAPPER_RE.match(text)
-    return m.group("kärna").strip() if m else text
+    for pat in YRKANDE_WRAPPER_PATTERNS:
+        m = pat.match(text)
+        if m:
+            return m.group("kärna").strip()
+    return text
 
 
-def passage_text(chunk):
-    """Det som faktiskt embeddas: en kontextrad, sedan yrkandets kärna.
-
-    Nästan alla yrkanden delar samma malltext ("Riksdagen ställer sig
-    bakom det som anförs i motionen om att ... och tillkännager detta för
-    regeringen") — den mallen konkurrerar om utrymme i embeddingen med
-    tiotusentals andra chunkar. Två åtgärder mot det: kontextraden sätter
-    parti och ämne FÖRE texten (samma "wordalisation"-princip som
-    rag_index.py använder för betänkanden), och yrkande_kärna() klipper
-    bort själva mallfrasen där den känns igen.
+def passage_core(chunk):
+    """Kontextrad + yrkandets kärna — det gemensamma innehållet som både
+    BM25 och embedding-modellen indexerar, bara paketerat olika (se
+    passage_text() och BM25 nedan). Kontextraden sätter parti och ämne
+    FÖRE texten (samma "wordalisation"-princip som rag_index.py använder
+    för betänkanden); yrkande_kärna() klipper bort mallfrasen ("Riksdagen
+    ställer sig bakom det som anförs i motionen om ... och tillkännager
+    detta för regeringen") som annars konkurrerar om utrymme med
+    tiotusentals andra chunkar.
     """
     namn = PARTY_NAMES.get(chunk.parti, chunk.parti)
     kontext = f"{namn} ({chunk.parti}), motion {chunk.beteckning} {chunk.rm}"
     if chunk.heading:
         kontext += f", om {chunk.heading}"
-    return f"passage: {kontext}\n{yrkande_kärna(chunk.text)}"
+    return f"{kontext}\n{yrkande_kärna(chunk.text)}"
+
+
+def passage_text(chunk):
+    """Det som faktiskt embeddas: samma kärna, med e5:s "passage: "-prefix."""
+    return f"passage: {passage_core(chunk)}"
 
 
 def parse_motion(path):
@@ -400,10 +515,12 @@ def encode(texts, stub=False, model_name=MODEL_NAME):
 
 
 def embed(chunks_path, out_dir, stub=False, model_name=MODEL_NAME):
-    """Läs motion_chunks.jsonl, bygg en passage per chunk, embedda, spara.
+    """Läs motion_chunks.jsonl, bygg en passage per chunk, embedda OCH
+    BM25-indexera, spara.
 
-    Skriver tre filer i out_dir:
+    Skriver fyra filer i out_dir:
       vectors.npy   en rad per chunk, samma ordning som meta.jsonl
+      bm25.pkl      det inverterade BM25-indexet över samma passages
       meta.jsonl    samma chunkar som lästes in — det man slår upp träffar i
       info.json     vilken modell, hur många chunkar, för att inte blanda
                     ihop index byggda med olika modeller av misstag
@@ -414,9 +531,10 @@ def embed(chunks_path, out_dir, stub=False, model_name=MODEL_NAME):
     rows = [json.loads(line) for line in open(chunks_path, encoding="utf-8")]
     print(f"{len(rows)} chunkar inlästa från {chunks_path}")
 
-    passages = [passage_text(Chunk(**{k: v for k, v in r.items()
-                                      if k in Chunk.__dataclass_fields__}))
-                for r in rows]
+    chunkar = [Chunk(**{k: v for k, v in r.items()
+                        if k in Chunk.__dataclass_fields__})
+               for r in rows]
+    cores = [passage_core(c) for c in chunkar]
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -425,7 +543,10 @@ def embed(chunks_path, out_dir, stub=False, model_name=MODEL_NAME):
         for r in rows:
             fh.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-    vek = encode(passages, stub=stub, model_name=model_name)
+    print("bygger BM25 …")
+    BM25([tokenize_list(c) for c in cores]).save(out_dir / "bm25.pkl")
+
+    vek = encode([f"passage: {c}" for c in cores], stub=stub, model_name=model_name)
     np.save(out_dir / "vectors.npy", vek)
 
     with open(out_dir / "info.json", "w", encoding="utf-8") as fh:
@@ -434,6 +555,283 @@ def embed(chunks_path, out_dir, stub=False, model_name=MODEL_NAME):
                   fh, ensure_ascii=False, indent=2)
 
     print(f"skrev {out_dir}/  ({vek.shape[0]} × {vek.shape[1]})")
+
+
+# --------------------------------------------------------------------------
+# search — fråga -> mest lika chunkar
+# --------------------------------------------------------------------------
+
+# RRF väger normalt de två listorna lika. rag_index.py:s utvärdering visar
+# att BM25 är klart svagare än vektorlistan på naturligt formulerade
+# frågor, men bra på att fånga upp exakta ord (som "kärnkraft" mot
+# "kärnvapen") som vektorsökningen blandar ihop. Samma vikter som
+# rag_index.py, som utgångspunkt — ingen egen utvärdering gjord här än.
+RRF_K = 60
+RRF_VIKT_BM25 = 0.35
+RRF_VIKT_VEKTOR = 1.0
+
+
+class Index:
+    """Håller vektorerna och BM25-indexet i minnet. Använd 'shell' för
+    flera frågor i rad — annars laddas embeddingmodellen om vid varje
+    CLI-anrop."""
+
+    def __init__(self, index_dir):
+        import numpy as np
+        index_dir = Path(index_dir)
+        self.info = json.load(open(index_dir / "info.json", encoding="utf-8"))
+        self.meta = [json.loads(l) for l in
+                     open(index_dir / "meta.jsonl", encoding="utf-8")]
+        self.vek = np.load(index_dir / "vectors.npy")
+        self.bm = BM25.load(index_dir / "bm25.pkl")
+        self.stub = self.info["model"] == "stub"
+
+    def _encode_query(self, fråga):
+        q = f"query: {fråga}"
+        if self.stub:
+            return stub_vectors([q])[0]
+        if not hasattr(self, "_modell"):
+            from sentence_transformers import SentenceTransformer
+            self._modell = SentenceTransformer(self.info["model"])
+        return self._modell.encode([q], normalize_embeddings=True,
+                                   convert_to_numpy=True).astype("float32")[0]
+
+    def search(self, fråga, k=8, parti=None, kandidater=300):
+        import numpy as np
+
+        bm_lista = self.bm.search(fråga, limit=kandidater)
+
+        qv = self._encode_query(fråga)
+        sim = self.vek @ qv        # kosinuslikhet, vektorerna är redan normaliserade
+        vek_lista = [(int(i), float(sim[i])) for i in np.argsort(-sim)[:kandidater]]
+
+        # RRF: rangordning slås ihop utan att normalisera två olika
+        # poängskalor (BM25:s och kosinuslikhetens) mot varandra.
+        rrf = defaultdict(float)
+        for vikt, lista in ((RRF_VIKT_BM25, bm_lista), (RRF_VIKT_VEKTOR, vek_lista)):
+            for rang, (i, _) in enumerate(lista):
+                rrf[i] += vikt / (RRF_K + rang + 1)
+
+        träffar = []
+        for i, poäng in sorted(rrf.items(), key=lambda kv: -kv[1]):
+            m = self.meta[i]
+            if parti and m.get("parti") not in parti:
+                continue
+            träffar.append((poäng, m))
+            if len(träffar) >= k:
+                break
+        return träffar
+
+
+def visa(träffar):
+    if not träffar:
+        print("inga träffar")
+        return
+    for n, (poäng, m) in enumerate(träffar, 1):
+        print(f"\n{n:2}. [{poäng:.3f}] {m['parti']} — motion {m['beteckning']} {m['rm']}")
+        if m.get("heading"):
+            print(f"    om: {m['heading']}")
+        print(f"    {m['text']}")
+
+
+# --------------------------------------------------------------------------
+# svar — hämtning + LLM. Samma mönster som answer.py i huvudrepot.
+# --------------------------------------------------------------------------
+
+GEMINI_MODELL = "gemini-3.6-flash"
+MAX_KONTEXT_TECKEN = 24000
+MAX_UT_TOKENS = 4096
+
+# Steg 1 och 4 (vem den är, hur den ska svara). Steg 2 (vad den vet) ligger
+# i KUNSKAP nedan.
+SYSTEM = """Du är en granskare av svensk partipolitik. Materialet du får är
+motioner — formella förslag som riksdagsledamöter lämnar in i sitt partis
+namn.
+
+REGLER, i fallande ordning:
+
+1. Du använder ENDAST det material du får i KONTEXT. Har du egna minnen av
+   svensk politik är de föråldrade och du använder dem inte. Räcker
+   kontexten inte för att svara säger du det rent ut i stället för att
+   gissa eller koppla ihop lösa trådar.
+
+2. Varje sakpåstående följs av sin källa i hakparentes, t.ex. [2] eller
+   [motion 2751 2023/24]. Ett påstående utan källa får inte skrivas.
+
+3. En motion är ETT FÖRSLAG partiet lämnat in — inte ett beslut, inte en
+   lag, inte en bekräftad utfall. Skriv alltid "X har föreslagit" eller
+   "X vill", ALDRIG "X har genomfört" eller "X har åstadkommit", eftersom
+   materialet inte visar vad som hände sen (avslogs, bifölls, kom aldrig
+   upp till omröstning). Nämner samma parti samma krav i flera motioner
+   över flera år, konstatera det (partiet har återkommit till frågan) men
+   gissa inte på VARFÖR — det vet du inte utan betänkandet och omröstningen.
+
+4. Du rekommenderar ALDRIG ett parti och rangordnar dem aldrig. Ber
+   användaren om en rekommendation förklarar du kort att du redovisar vad
+   partierna föreslagit, och erbjuder en sakfrågejämförelse i stället.
+
+5. Saknar ett parti motioner om ämnet i just detta material, skriv det
+   som ett konstaterande ("Materialet innehåller ingen motion från SD om
+   detta") — inte som att partiet saknar en åsikt.
+
+FORM: svar på svenska, löpande text, två till fem stycken. Jämför du flera
+partier, ett stycke per parti i samma ordning varje gång."""
+
+# Steg 2: vad den vet. Q&A-par som lär modellen materialets semantik — utan
+# dem riskerar den att övertolka ett yrkande som beslutad politik.
+KUNSKAP = [
+    ("Vad är en motion?",
+     "Ett formellt förslag som en eller flera riksdagsledamöter lämnar in "
+     "i riksdagen, i sitt partis namn. Den innehåller ett eller flera "
+     "yrkanden — konkreta beslutsförslag — och en motivering till varför. "
+     "En motion är partiets egen, unfiltrerade begäran, inte ett resultat "
+     "av förhandling med andra partier (till skillnad från ett "
+     "betänkande)."),
+    ("Betyder 'Riksdagen ställer sig bakom det som anförs i motionen om X "
+     "och tillkännager detta för regeringen' att X blev verklighet?",
+     "Nej. Det är den formella texten för ett tillkännagivande — en "
+     "signal till regeringen om vad riksdagen vill, inte en lag och inte "
+     "ett bindande beslut. Även om riksdagen röstar ja till just den här "
+     "formuleringen är regeringen inte juridiskt tvingad att agera på "
+     "den. Motionen i sig säger heller ingenting om huruvida någon "
+     "omröstning ens hållits."),
+    ("Vad är skillnaden mellan ett yrkande och en sektion/motivering?",
+     "Yrkandet är den korta, formella beslutsmeningen. Motiveringen (eller "
+     "en namngiven underrubrik) är resonemanget bakom den — varför "
+     "partiet vill det. Har ett yrkande ingen kopplad motivering i "
+     "materialet betyder det bara att kopplingen inte gick att fastställa "
+     "automatiskt, inte att partiet saknar ett skäl."),
+    ("Ett parti har lämnat in nästan identiska yrkanden flera år i rad — "
+     "vad betyder det?",
+     "Bara att partiet återkommit till samma krav. Det kan bero på att "
+     "det avslagits tidigare, att det inte kommit upp till behandling, "
+     "eller andra skäl materialet inte visar. Dra ingen slutsats om "
+     "UTFALLET — bara om att frågan är återkommande för partiet."),
+]
+
+
+def _källnummer(träffar):
+    """Ett löpnummer per UNIKT källdokument (motion), i den ordning de
+    först dyker upp i träfflistan. Utan detta numrerades citat efter
+    position i träfflistan (1-8) — chunkar 3 och 4 kunde råka vara samma
+    motion som chunk 1, försvinna ur källistan som dubbletter, men LLM:en
+    hade redan citerat dem som [3]/[4] i kontexten den fick. Resultat: ett
+    svar med källhänvisningar som saknade motsvarande rad i "Källor".
+    Chunkar från samma motion delar nu nummer, så varje citerat nummer
+    alltid går att slå upp."""
+    nummer, näst = {}, 1
+    for _, m in träffar:
+        källa = f"motion {m['beteckning']} {m['rm']}"
+        if källa not in nummer:
+            nummer[källa] = näst
+            näst += 1
+    return nummer
+
+
+def bygg_kontext(träffar, tak=MAX_KONTEXT_TECKEN):
+    nummer = _källnummer(träffar)
+    delar, n = ["HÄMTADE MOTIONSUTDRAG"], 0
+    for _poäng, m in träffar:
+        källa = f"motion {m['beteckning']} {m['rm']}"
+        bit = (f"\n[{nummer[källa]}] {m['parti']} — {källa}"
+               f"{' — ' + m['heading'] if m.get('heading') else ''}\n"
+               f"{m['text']}")
+        if m.get("sektion_text"):
+            bit += f"\nMotivering: {m['sektion_text']}"
+        bit += "\n"
+        if n + len(bit) > tak:
+            break
+        delar.append(bit)
+        n += len(bit)
+    return "\n".join(delar)
+
+
+def kallista(träffar):
+    nummer = _källnummer(träffar)
+    ut, sedda = [], set()
+    for _p, m in träffar:
+        källa = f"motion {m['beteckning']} {m['rm']}"
+        if källa in sedda:
+            continue
+        sedda.add(källa)
+        ut.append(f"[{nummer[källa]}] {m['parti']} — {källa}")
+    return ut
+
+
+def bygg_innehall(fråga, kontext):
+    """Gemini-format: växlande user/model-turer, kontexten sist."""
+    innehåll = []
+    for f, s in KUNSKAP:
+        innehåll.append({"role": "user", "parts": [{"text": f}]})
+        innehåll.append({"role": "model", "parts": [{"text": s}]})
+    innehåll.append({"role": "user", "parts": [{"text":
+        f"KONTEXT\n{kontext}\n\nSLUT PÅ KONTEXT\n\nFRÅGA: {fråga}"}]})
+    return innehåll
+
+
+def fraga_gemini(innehåll, modell=GEMINI_MODELL, forsok=8):
+    """Samma anropslogik (försök-om-vid-övergående-fel) som answer.py."""
+    import random
+    import time
+    from google import genai
+    from google.genai import types
+
+    import os
+    nyckel = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not nyckel:
+        sys.exit("sätt GEMINI_API_KEY (nyckel från https://aistudio.google.com)")
+    klient = genai.Client(api_key=nyckel)
+
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM, temperature=0.2,
+        max_output_tokens=MAX_UT_TOKENS)
+
+    OVERGAENDE = ("429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE",
+                  "500", "INTERNAL", "504", "DEADLINE_EXCEEDED")
+
+    for n in range(forsok):
+        try:
+            svar = klient.models.generate_content(
+                model=modell, contents=innehåll, config=config)
+        except Exception as fel:
+            text = str(fel)
+            if not any(kod in text for kod in OVERGAENDE):
+                raise
+            if n == forsok - 1:
+                break
+            paus = min(60, 2 ** n * 4) * (0.5 + random.random())
+            print(f"  (övergående fel, försöker igen om {paus:.0f}s …)",
+                  file=sys.stderr)
+            time.sleep(paus)
+            continue
+        if not svar.text:
+            skal = ""
+            if getattr(svar, "candidates", None):
+                skal = str(getattr(svar.candidates[0], "finish_reason", "") or "")
+            return f"[inget svar genererades — finish_reason: {skal or 'okänt'}]"
+        return svar.text
+
+    sys.exit(f"gav upp efter {forsok} försök mot {modell}")
+
+
+def svara(idx, fråga, k=8, torrkor=False):
+    partier = parti_i_fragan(fråga)
+    träffar = idx.search(fråga, k=k, parti=partier or None)
+    kontext = bygg_kontext(träffar)
+    innehåll = bygg_innehall(fråga, kontext)
+    if torrkor:
+        return None, träffar, innehåll
+    return fraga_gemini(innehåll), träffar, innehåll
+
+
+def skriv(svar, träffar, innehåll, torrkor):
+    if torrkor:
+        print(innehåll[-1]["parts"][0]["text"])
+        return
+    print(svar)
+    print("\nKällor:")
+    for rad in kallista(träffar):
+        print(" ", rad)
 
 
 # --------------------------------------------------------------------------
@@ -478,6 +876,51 @@ def main():
             sys.exit(__doc__)
         stub = len(sys.argv) == 5 and sys.argv[4] == "--stub"
         embed(sys.argv[2], sys.argv[3], stub=stub)
+    elif cmd == "search":
+        if len(sys.argv) != 4:
+            sys.exit(__doc__)
+        idx = Index(sys.argv[2])
+        fråga = sys.argv[3]
+        partier = parti_i_fragan(fråga)
+        if partier:
+            print(f"[partifilter: {', '.join(partier)}]")
+        visa(idx.search(fråga, parti=partier or None))
+    elif cmd == "shell":
+        if len(sys.argv) != 3:
+            sys.exit(__doc__)
+        idx = Index(sys.argv[2])
+        print(f"{idx.info['n']} chunkar, modell {idx.info['model']}. Tom rad avslutar.")
+        while True:
+            try:
+                fråga = input("\n> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if not fråga:
+                break
+            partier = parti_i_fragan(fråga)
+            if partier:
+                print(f"[partifilter: {', '.join(partier)}]")
+            visa(idx.search(fråga, parti=partier or None))
+    elif cmd == "fraga":
+        if len(sys.argv) not in (4, 5):
+            sys.exit(__doc__)
+        torrkor = len(sys.argv) == 5 and sys.argv[4] == "--torrkor"
+        idx = Index(sys.argv[2])
+        skriv(*svara(idx, sys.argv[3], torrkor=torrkor), torrkor=torrkor)
+    elif cmd == "chatt":
+        if len(sys.argv) not in (3, 4):
+            sys.exit(__doc__)
+        torrkor = len(sys.argv) == 4 and sys.argv[3] == "--torrkor"
+        idx = Index(sys.argv[2])
+        print(f"{idx.info['n']} chunkar. Tom rad avslutar.")
+        while True:
+            try:
+                fråga = input("\n> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if not fråga:
+                break
+            skriv(*svara(idx, fråga, torrkor=torrkor), torrkor=torrkor)
     else:
         sys.exit(__doc__)
 
