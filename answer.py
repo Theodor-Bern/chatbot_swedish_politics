@@ -4,7 +4,6 @@ answer.py — the answering step. This is where the LLM comes in, and nowhere el
 The chain:
     question
       -> parties_in_question()  parameter extraction: "moderaterna" -> M
-      -> choose_layer()         is it about what they SAY, PROPOSE or DID?
       -> retrieve()             retrieval, with fixed slots per party and layer
       -> vote_facts()           looks up the votes for the retrieved punkter
       -> build_context()        all of the above as text, with a source id on each piece
@@ -46,9 +45,11 @@ except ImportError:
 
 MODEL = "gemini-3.6-flash"
 MAX_CONTEXT_CHARS = 40000
-# A motion's argument can be several thousand characters; the start is enough
-# to show what the yrkande is about, and the rest would crowd out other parties.
-MAX_ARGUMENT_CHARS = 600
+# A motion's argument can be several thousand characters. With 8 parties in the
+# prompt, the start is enough to show what the yrkande is about, and more would
+# crowd out other parties. A single-party question has room for more of the
+# reasoning — which is what "vad innebär de i praktiken?" needs.
+MAX_ARGUMENT_CHARS = {"one_party": 1500, "several_parties": 600}
 MAX_OUTPUT_TOKENS = 4096
 # Gemini 3 "thinks" before answering, and the thinking counts against
 # max_output_tokens. We want the given text restated, not reasoning — that
@@ -76,16 +77,6 @@ ALIAS = {
     "l": "L", "liberalerna": "L", "folkpartiet": "L",
 }
 
-# The question is specifically about a vote / a Riksdag decision. "drivit" and
-# "gjort" were removed from here: they're too vague to mean "only votes" and
-# used to push the motion layer out of answers to "vad har partierna gjort för X".
-DID_WORDS = re.compile(
-    r"\brösta|\broste|votering|reservation|riksdag|utskott|betänkand|"
-    r"genomfört|beslut|proposition", re.IGNORECASE)
-# The question is specifically about motions / yrkanden.
-MOTION_WORDS = re.compile(
-    r"\bmotioner?|\byrkand|\bföreslagit|\bföresla[gr]\b",
-    re.IGNORECASE)
 # Questions where the right answer is NOT to answer (voting advice).
 VOTING_ADVICE_WORDS = re.compile(
     r"vilket parti (ska|bör) jag|passar mig|rösta på|vem ska jag rösta|"
@@ -93,7 +84,7 @@ VOTING_ADVICE_WORDS = re.compile(
 
 
 # --------------------------------------------------------------------------
-# parameter extraction and routing
+# parameter extraction
 # --------------------------------------------------------------------------
 
 def parties_in_question(question):
@@ -109,20 +100,12 @@ def parties_in_question(question):
     return found
 
 
-def choose_layer(question):
-    """'did', 'motion', or None (= all layers).
-
-    Routes to a specific layer only on clear keywords. General party-position
-    questions ("vad tycker SD om …") search all layers, with a fixed quota per
-    layer — see LAYER_QUOTA.
-    """
-    did = bool(DID_WORDS.search(question))
-    motion = bool(MOTION_WORDS.search(question))
-    if did and not motion:
-        return "did"
-    if motion and not did:
-        return "motion"
-    return None
+# Every question searches all layers. There's deliberately no keyword routing:
+# guessing layers from words misfired ("använd inga betänkanden" routed TO
+# betänkanden), and a question that mentions votes still deserves the party's
+# motions and website for context. Gemini reads the question and decides what
+# to emphasise; --layer on the CLI restricts retrieval by hand.
+ALL_LAYERS = ["motion", "did", "said"]
 
 
 # --------------------------------------------------------------------------
@@ -223,7 +206,10 @@ def vote_facts(hits, parties):
 # context
 # --------------------------------------------------------------------------
 
-def build_context(hits, votes, limit=MAX_CONTEXT_CHARS):
+def build_context(hits, votes, argument_chars, limit=MAX_CONTEXT_CHARS, start=1):
+    """The retrieved material as text. Passages are numbered from `start`;
+    limit=None keeps every passage (tool results: a numbered passage must
+    never be dropped, or a cited number would point at nothing)."""
     parts, n = [], 0
     if votes:
         block = "OMRÖSTNINGAR I RIKSDAGEN\n\n" + "\n\n".join(votes)
@@ -231,7 +217,7 @@ def build_context(hits, votes, limit=MAX_CONTEXT_CHARS):
         n += len(block)
 
     parts.append("\nHÄMTADE TEXTER")
-    for i, (_score, m) in enumerate(hits, 1):
+    for i, (_score, m) in enumerate(hits, start):
         if m.get("layer") == "motion":
             source = f"motion {m.get('beteckning', '')} {m.get('rm', '')}"
         else:
@@ -239,11 +225,11 @@ def build_context(hits, votes, limit=MAX_CONTEXT_CHARS):
         piece = f"\n[{i}] {m['layer'].upper()} — {m['kontext']}\nkälla: {source}\n{m['text']}"
         if m.get("layer") == "motion" and m.get("sektion_text"):
             argument = m["sektion_text"]
-            if len(argument) > MAX_ARGUMENT_CHARS:
-                argument = argument[:MAX_ARGUMENT_CHARS].rsplit(" ", 1)[0] + " …"
+            if len(argument) > argument_chars:
+                argument = argument[:argument_chars].rsplit(" ", 1)[0] + " …"
             piece += f"\nMotivering: {argument}"
         piece += "\n"
-        if n + len(piece) > limit:
+        if limit and n + len(piece) > limit:
             break
         parts.append(piece)
         n += len(piece)
@@ -253,7 +239,7 @@ def build_context(hits, votes, limit=MAX_CONTEXT_CHARS):
 def source_list(hits):
     """One line per source, with every passage number that points to it:
     several passages from the same page/motion must not leave a cited number
-    missing from the list."""
+    missing from the list. Numbering matches build_context: hits[0] is [1]."""
     numbers = {}
     for i, (_score, m) in enumerate(hits, 1):
         if m.get("layer") == "motion":
@@ -386,45 +372,54 @@ KNOWLEDGE = [
 ]
 
 
+def knowledge_turns():
+    """KNOWLEDGE as alternating user/model turns (Gemini's chat format)."""
+    turns = []
+    for q, a in KNOWLEDGE:
+        turns.append({"role": "user", "parts": [{"text": q}]})
+        turns.append({"role": "model", "parts": [{"text": a}]})
+    return turns
+
+
+VOTING_ADVICE_NOTE = ("\n\nOBS: användaren ber om en partirekommendation. "
+                      "Följ regel 3 — rekommendera inte, förklara kort "
+                      "varför, och erbjud en sakfrågejämförelse.\n")
+
+
 def build_contents(question, context, voting_advice):
     """Gemini format: alternating user/model turns, the context last."""
-    contents = []
-    for q, a in KNOWLEDGE:
-        contents.append({"role": "user", "parts": [{"text": q}]})
-        contents.append({"role": "model", "parts": [{"text": a}]})
-
-    instruction = ""
-    if voting_advice:
-        instruction = ("\n\nOBS: användaren ber om en partirekommendation. "
-                       "Följ regel 3 — rekommendera inte, förklara kort "
-                       "varför, och erbjud en sakfrågejämförelse.\n")
-
-    contents.append({"role": "user", "parts": [{"text":
+    instruction = VOTING_ADVICE_NOTE if voting_advice else ""
+    return knowledge_turns() + [{"role": "user", "parts": [{"text":
         f"KONTEXT\n{context}\n\nSLUT PÅ KONTEXT{instruction}\n\n"
-        f"FRÅGA: {question}"}]})
-    return contents
+        f"FRÅGA: {question}"}]}]
 
 
 # --------------------------------------------------------------------------
 # Gemini
 # --------------------------------------------------------------------------
-def ask_gemini(contents, model=MODEL, attempts=8):
-    import random
-    from google import genai
-    from google.genai import types
 
+def gemini_client():
+    from google import genai
     key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not key:
         sys.exit("set GEMINI_API_KEY (key from https://aistudio.google.com)")
-    client = genai.Client(api_key=key)
+    return genai.Client(api_key=key)
+
+
+def generate(client, model, contents, system=SYSTEM, attempts=8, **config):
+    """One generate_content request, with retries on transient errors.
+    Returns the raw response. Extra keyword arguments (tools, tool_config, …)
+    go into the GenerateContentConfig."""
+    import random
+    from google.genai import types
 
     def make_config(thinking):
         extra = {"thinking_config": thinking} if thinking is not None else {}
         return types.GenerateContentConfig(
-            system_instruction=SYSTEM,
+            system_instruction=system,
             temperature=0.2,          # restating, not creativity
             max_output_tokens=MAX_OUTPUT_TOKENS,
-            **extra)
+            **config, **extra)
 
     # Gemini 3 controls thinking with thinking_level, older models with
     # thinking_budget, and some allow neither. The API only answers "invalid
@@ -450,7 +445,7 @@ def ask_gemini(contents, model=MODEL, attempts=8):
     for n in range(attempts):
         name, thinking = variants[v]
         try:
-            response = client.models.generate_content(
+            return client.models.generate_content(
                 model=model, contents=contents, config=make_config(thinking))
         except Exception as err:
             text = str(err)
@@ -470,26 +465,32 @@ def ask_gemini(contents, model=MODEL, attempts=8):
             print(f"  ({reason}, retrying in {pause:.0f}s …)",
                   file=sys.stderr)
             time.sleep(pause)
-            continue
-
-        # Was the answer cut off? Half an answer is worse than none: it looks
-        # finished but lacks both the conclusion and the source references.
-        finish = ""
-        if getattr(response, "candidates", None):
-            finish = str(getattr(response.candidates[0], "finish_reason", "") or "")
-        if "MAX_TOKENS" in finish:
-            print(f"  WARNING: the answer was cut off at {MAX_OUTPUT_TOKENS} tokens. "
-                  f"Raise MAX_OUTPUT_TOKENS or lower MAX_CONTEXT_CHARS.",
-                  file=sys.stderr)
-        if not response.text:
-            print(f"  (empty answer, finish_reason={finish or 'unknown'})",
-                  file=sys.stderr)
-            return f"[no answer was generated — finish_reason: {finish or 'unknown'}]"
-        return response.text
 
     sys.exit(f"gave up after {attempts} attempts against {model} — "
              f"try another model or wait a while")
 
+
+def answer_text(response):
+    """The final text, with a warning if it was cut off. Half an answer is
+    worse than none: it looks finished but lacks both the conclusion and the
+    source references."""
+    finish = ""
+    if getattr(response, "candidates", None):
+        finish = str(getattr(response.candidates[0], "finish_reason", "") or "")
+    if "MAX_TOKENS" in finish:
+        print(f"  WARNING: the answer was cut off at {MAX_OUTPUT_TOKENS} tokens. "
+              f"Raise MAX_OUTPUT_TOKENS or lower MAX_CONTEXT_CHARS.",
+              file=sys.stderr)
+    if not response.text:
+        print(f"  (empty answer, finish_reason={finish or 'unknown'})",
+              file=sys.stderr)
+        return f"[no answer was generated — finish_reason: {finish or 'unknown'}]"
+    return response.text
+
+
+def ask_gemini(contents, model=MODEL):
+    """The one-call path: all material is already in `contents`."""
+    return answer_text(generate(gemini_client(), model, contents))
 
 
 def list_models():
@@ -516,8 +517,11 @@ def list_models():
 # always beats short motion yrkanden on pure vector similarity. Motions weigh
 # most — they are the party's concrete, dated proposals; the website is
 # self-description.
+# A single party has room for more: the prompt for one party used ~5,500 of
+# 40,000 characters, and "vilka motioner har M gjort…" got only 4 motions. The
+# relevance cutoff still drops weak hits, so a bigger quota adds room, not noise.
 LAYER_QUOTA = {
-    "one_party": {"motion": 4, "did": 3, "said": 2},
+    "one_party": {"motion": 8, "did": 4, "said": 3},
     "several_parties": {"motion": 2, "did": 1, "said": 1},   # per party
 }
 # Relevance cutoff on cosine similarity. e5's values are tightly packed (often
@@ -531,11 +535,14 @@ MAX_DISTANCE = 0.04
 MIN_SIMILARITY = {"motion": 0.80, "said": 0.80, "did": 0.83}
 
 
-def retrieve(idx, question, parties, layer=None, method="hybrid"):
+def retrieve(idx, question, parties, layers=ALL_LAYERS, method="hybrid"):
     """Retrieval with fixed slots: (hits, gaps), where gaps are the
     (party, layer) pairs that got no hit above the relevance cutoff."""
     quota = LAYER_QUOTA["one_party" if len(parties) == 1 else "several_parties"]
-    layers = {layer: sum(quota.values())} if layer else quota
+    if len(layers) == 1:        # a single layer gets all the slots
+        layers = {layers[0]: sum(quota.values())}
+    else:
+        layers = {l: quota[l] for l in layers}
 
     slots = {}
     for party in parties or list(PARTY_NAMES):
@@ -572,18 +579,18 @@ def retrieve(idx, question, parties, layer=None, method="hybrid"):
 
 def answer(idx, question, method="hybrid", model=MODEL, dry_run=False, layer=None):
     parties = parties_in_question(question)
-    if layer is None:
-        layer = choose_layer(question)
+    layers = [layer] if layer else ALL_LAYERS
     voting_advice = bool(VOTING_ADVICE_WORDS.search(question))
-    hits, gaps = retrieve(idx, question, parties, layer, method)
+    hits, gaps = retrieve(idx, question, parties, layers, method)
     votes = vote_facts(hits, parties)
-    context = build_context(hits, votes)
+    size = "one_party" if len(parties) == 1 else "several_parties"
+    context = build_context(hits, votes, MAX_ARGUMENT_CHARS[size])
     if gaps:
         context += "\n\nINGET RELEVANT MATERIAL HITTADES FÖR\n" + "\n".join(
             f"- {PARTY_NAMES[p]} ({p}): {LAYER_NAMES_SV[l]}" for p, l in gaps)
     contents = build_contents(question, context, voting_advice)
 
-    info = {"parties": parties or "all", "layer": layer or "all",
+    info = {"parties": parties or "all", "layers": ",".join(layers),
             "hits": len(hits), "gaps": len(gaps),
             "vote_points": len(votes), "voting_advice": voting_advice,
             "context_chars": len(context)}
@@ -598,12 +605,154 @@ LAYER_NAMES_SV = {"said": "hemsidan", "did": "riksdagsbeslut/voteringar",
                   "motion": "motioner"}
 
 
+# --------------------------------------------------------------------------
+# tool calling: Gemini decides which layers and parties to search
+# --------------------------------------------------------------------------
+
+# Gemini makes all its searches as parallel calls in ONE step, then answers:
+# 2 API calls per question. One extra search step is allowed (3 calls); after
+# that the model must answer. With ~20 calls a day, every call counts.
+TOOL_ROUNDS = 2
+
+# Added to SYSTEM in tool mode (Swedish: Gemini reads it).
+TOOL_INSTRUCTIONS = """
+
+SÖKNING: Du har inget material från början. Du hämtar det med verktyget sok,
+och sökresultaten är din KONTEXT.
+
+- Gör ALLA sökningar du behöver i ett och samma steg, som parallella anrop.
+  Du får högst ett steg till för kompletterande sökningar, sedan svarar du.
+- lager: motion = partiernas motioner, did = betänkanden och omröstningar,
+  said = partiernas webbplatser.
+- Sök som standard i alla tre lagren. Utelämna ett lager BARA om användaren
+  uttryckligen ber om det ("bara motioner", "använd inga betänkanden"). Att
+  frågan nämner omröstningar eller betänkanden är inget skäl att utelämna
+  motioner eller webbplatser.
+- partier: partikoderna (S, M, SD, C, V, KD, MP, L) för de partier frågan
+  gäller, även när de står i genitiv ("Moderaternas" = M). Utelämna för en
+  jämförelse mellan alla partier.
+- fraga: en fullständig, naturlig fråga på svenska om sakfrågan, t.ex.
+  "Vad tycker partierna om migration och asylpolitik?" — INTE ett enstaka
+  sökord. Sökningen är byggd för hela frågor; ett ensamt ord som
+  "migration" ger så låg träffsäkerhet att relevant material sorteras bort.
+- Hänvisa till passagerna med numren i sökresultaten."""
+
+
+def search_tool():
+    from google.genai import types
+    return types.Tool(function_declarations=[types.FunctionDeclaration(
+        name="sok",
+        description="Söker i materialet om svensk partipolitik. Ett anrop söker "
+                    "ETT lager. Returnerar numrerade passager att hänvisa till.",
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                # A full question, not a keyword: e5 scores one-word queries
+                # much lower (0.77–0.82 vs 0.83–0.86 for "migration"), below
+                # MIN_SIMILARITY, which was calibrated on natural questions —
+                # a keyword search dropped 5 of 8 parties' websites as gaps.
+                "fraga": types.Schema(
+                    type="STRING",
+                    description="En fullständig, naturlig fråga om sakfrågan, "
+                                "t.ex. 'Vad tycker partierna om migration och "
+                                "asylpolitik?'. Inte ett enstaka sökord."),
+                "lager": types.Schema(
+                    type="STRING", enum=ALL_LAYERS,
+                    description="motion = motioner, did = betänkanden och "
+                                "omröstningar, said = partiernas webbplatser."),
+                "partier": types.Schema(
+                    type="ARRAY",
+                    items=types.Schema(type="STRING", enum=list(PARTY_NAMES)),
+                    description="Partikoder att söka för. Utelämna för alla partier."),
+            },
+            required=["fraga", "lager"]))])
+
+
+def run_search(idx, args, shown, method="hybrid"):
+    """Executes one 'sok' call: the same retrieval as the one-call path, for a
+    single layer. Returns the text Gemini reads, plus stats. `shown` holds the
+    passages returned so far this question; new ones are numbered after them
+    and appended, so the numbers stay unique across searches."""
+    layer = args.get("lager")
+    if layer not in ALL_LAYERS:
+        return f"Okänt lager: {layer}. Välj motion, did eller said.", 0, 0
+    parties = [p for p in (args.get("partier") or []) if p in PARTY_NAMES]
+    hits, gaps = retrieve(idx, args.get("fraga") or "", parties, [layer], method)
+
+    already = {m["id"] for _, m in shown}
+    new = [(score, m) for score, m in hits if m["id"] not in already]
+    start = len(shown) + 1
+    shown.extend(new)
+
+    votes = vote_facts(new, parties) if layer == "did" else []
+    size = "one_party" if len(parties) == 1 else "several_parties"
+    text = build_context(new, votes, MAX_ARGUMENT_CHARS[size], limit=None, start=start)
+    if gaps:
+        text += "\n\nINGET RELEVANT MATERIAL HITTADES FÖR\n" + "\n".join(
+            f"- {PARTY_NAMES[p]} ({p}): {LAYER_NAMES_SV[l]}" for p, l in gaps)
+    if not new and hits:
+        text += "\n\n(Alla träffar i den här sökningen har redan visats ovan.)"
+    return text, len(gaps), len(votes)
+
+
+def answer_with_tools(idx, question, method="hybrid", model=MODEL):
+    """Gemini searches with the 'sok' tool, then answers. A manual loop, not
+    the SDK's automatic function calling: we control the number of API calls
+    and keep the passage numbers consistent across searches."""
+    from google.genai import types
+
+    client = gemini_client()
+    voting_advice = bool(VOTING_ADVICE_WORDS.search(question))
+    note = VOTING_ADVICE_NOTE if voting_advice else ""
+    contents = knowledge_turns() + [
+        {"role": "user", "parts": [{"text": f"FRÅGA: {question}{note}"}]}]
+
+    shown, searches, calls = [], [], 0
+    gaps = vote_points = context_chars = 0
+    for step in range(TOOL_ROUNDS + 1):
+        # The last step may not search: it must answer with what it has.
+        mode = "NONE" if step == TOOL_ROUNDS else "AUTO"
+        response = generate(
+            client, model, contents, system=SYSTEM + TOOL_INSTRUCTIONS,
+            tools=[search_tool()],
+            tool_config=types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(mode=mode)),
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True))
+        calls += 1
+        function_calls = response.function_calls or []
+        if not function_calls:
+            break
+
+        # The model's turn goes back unchanged: Gemini 3 needs its "thought
+        # signatures" in the history to continue after a function call.
+        contents.append(response.candidates[0].content)
+        results = []
+        for fc in function_calls:
+            args = dict(fc.args or {})
+            searches.append(f"{args.get('lager')}:{','.join(args.get('partier') or []) or 'alla'}"
+                            f" \"{args.get('fraga', '')}\"")
+            text, n_gaps, n_votes = run_search(idx, args, shown, method)
+            gaps += n_gaps
+            vote_points += n_votes
+            context_chars += len(text)
+            results.append(types.Part.from_function_response(
+                name=fc.name, response={"result": text}))
+        contents.append(types.Content(role="user", parts=results))
+
+    info = {"parties": "chosen by Gemini", "layers": " ".join(searches) or "none",
+            "hits": len(shown), "gaps": gaps, "vote_points": vote_points,
+            "voting_advice": voting_advice, "context_chars": context_chars,
+            "api_calls": calls}
+    return answer_text(response), shown, info, contents
+
+
 def print_answer(response, hits, info, contents, dry_run):
-    print(f"\n[{info['parties']} | layer: {info['layer']} | "
+    print(f"\n[{info['parties']} | layers: {info['layers']} | "
           f"{info['hits']} hits | {info['gaps']} gaps | "
           f"{info['vote_points']} vote points | "
           f"{info['context_chars']} chars"
-          f"{' | VOTING ADVICE' if info['voting_advice'] else ''}]\n")
+          + (f" | {info['api_calls']} API calls" if "api_calls" in info else "")
+          + f"{' | VOTING ADVICE' if info['voting_advice'] else ''}]\n")
     if dry_run:
         print(contents[-1]["parts"][0]["text"])
         return
@@ -622,12 +771,25 @@ def main():
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--index", default=rag_index.INDEX_DIR)
     ap.add_argument("--dry-run", action="store_true",
-                    help="build the prompt and print it, don't call the API")
+                    help="build the one-call prompt and print it, don't call the API")
+    ap.add_argument("--no-tools", action="store_true",
+                    help="one API call: retrieve everything up front instead of "
+                         "letting Gemini choose its searches")
     a = ap.parse_args()
 
     if a.question == "models":
         list_models()
         return
+
+    # Tool calling is the default. --dry-run can't use it (every tool step is
+    # an API call), and --layer is a manual restriction for the one-call path.
+    one_call = a.no_tools or a.dry_run or a.layer
+
+    def ask(q):
+        if one_call:
+            return answer(idx, q, method=a.method, model=a.model,
+                          dry_run=a.dry_run, layer=a.layer)
+        return answer_with_tools(idx, q, method=a.method, model=a.model)
 
     idx = rag_index.Index(a.index)
     if a.question == "chat":
@@ -639,14 +801,10 @@ def main():
                 break
             if not q:
                 break
-            print_answer(*answer(idx, q, method=a.method,
-                                 model=a.model, dry_run=a.dry_run, layer=a.layer),
-                         dry_run=a.dry_run)
+            print_answer(*ask(q), dry_run=a.dry_run)
         return
 
-    print_answer(*answer(idx, a.question, method=a.method,
-                         model=a.model, dry_run=a.dry_run, layer=a.layer),
-                 dry_run=a.dry_run)
+    print_answer(*ask(a.question), dry_run=a.dry_run)
 
 
 if __name__ == "__main__":
