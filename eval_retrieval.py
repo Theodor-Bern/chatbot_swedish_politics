@@ -1,28 +1,30 @@
 """
-eval_retrieval.py — mäter hur bra retrievalen är, innan vi bygger svarssteget.
+eval_retrieval.py — measures how good retrieval is, before the answering step.
 
-Facit ligger i eval/questions.json och uttrycks som REGLER över metadata, inte
-som handplockade passage-id:n. En träff är relevant om den uppfyller frågans
-"relevant"-villkor (rätt lager, rätt parti, rätt ämnesslug, rätt utskott).
-Det gör facit granskningsbart av hela gruppen och tåligt mot ombyggda index.
+Ground truth lives in eval/questions.json and is expressed as RULES over
+metadata, not as hand-picked passage ids. A hit is relevant if it meets the
+question's "relevant" condition (right layer, right party, right topic slug,
+right utskott). That keeps the ground truth reviewable by the whole group and
+robust against rebuilt indexes. The file's keys (sok, fraga, typ, relevant, …)
+and question types are its data format and stay Swedish.
 
-Frågetyperna mäter olika saker:
-  smal          hittar vi rätt sida för ETT parti?          -> P@k, MRR
-  bred          får ALLA partier plats i kontexten?         -> partitäckning
-  saknas        facit är noll träffar                       -> falska träffar
-  did           hittar vi rätt ärenden i riksdagsmaterialet -> P@k, MRR
-  identifierare hittar vi ett ärende på dess beteckning?    -> P@k, MRR
-  jamforelse    är båda lagren representerade?              -> lagertäckning
+The question types measure different things:
+  smal          do we find the right page for ONE party?       -> P@k, MRR
+  bred          do ALL parties get a place in the context?     -> party coverage
+  saknas        the ground truth is zero hits                  -> false hits
+  did           do we find the right cases in the Riksdag data -> P@k, MRR
+  identifierare do we find a case by its beteckning?           -> P@k, MRR
+  jamforelse    are both layers represented?                   -> layer coverage
 
-Frågor utan "relevant"-block (t.ex. typen 'avrader', som testar svarssteget
-och inte hämtningen) hoppas över helt.
+Questions without a "relevant" block (e.g. the type 'avrader', which tests the
+answering step, not retrieval) are skipped entirely.
 
-Kör:
-    python eval_retrieval.py                       # hybrid
-    python eval_retrieval.py --metod bm25          # kräver ingen modell
-    python eval_retrieval.py --metod bm25 --metod vektor --metod hybrid
-    python eval_retrieval.py --metod hybrid --vikt-bm25 0.15
-    python eval_retrieval.py --index out/index_v2 --detalj B02
+Run:
+    python eval_retrieval.py                        # hybrid
+    python eval_retrieval.py --method bm25          # needs no model
+    python eval_retrieval.py --method bm25 --method vector --method hybrid
+    python eval_retrieval.py --method hybrid --bm25-weight 0.15
+    python eval_retrieval.py --index out/index_v2 --detail B02
 """
 
 from __future__ import annotations
@@ -34,153 +36,153 @@ from collections import defaultdict
 
 import rag_index
 
-FRAGOR = "eval/questions.json"
-PARTIER = ["S", "M", "SD", "C", "V", "KD", "MP", "L"]
+QUESTIONS_FILE = "eval/questions.json"
+PARTIES = ["S", "M", "SD", "C", "V", "KD", "MP", "L"]
 
 
-def är_relevant(träff, regel):
-    """Uppfyller passagen frågans relevanskriterium?"""
-    if not regel:
+def is_relevant(hit, rule):
+    """Does the passage meet the question's relevance criterion?"""
+    if not rule:
         return False
-    if regel.get("layer") and träff.get("layer") != regel["layer"]:
+    if rule.get("layer") and hit.get("layer") != rule["layer"]:
         return False
-    if regel.get("parti"):
-        egna = {p for p in (träff.get("parti") or "").split(";") if p}
-        if not egna & set(regel["parti"]):
+    if rule.get("parti"):
+        own = {p for p in (hit.get("parti") or "").split(";") if p}
+        if not own & set(rule["parti"]):
             return False
-    if regel.get("beteckning") and träff.get("beteckning") not in regel["beteckning"]:
+    if rule.get("beteckning") and hit.get("beteckning") not in rule["beteckning"]:
         return False
-    if regel.get("rm") and träff.get("rm") not in regel["rm"]:
+    if rule.get("rm") and hit.get("rm") not in rule["rm"]:
         return False
-    if regel.get("utskott"):
-        # Utskottskoderna är blandade versaler (JuU, SfU, MJU) eftersom de
-        # kommer från beteckningens prefix. Jämför skiftlägesokänsligt.
-        vill = {u.lower() for u in regel["utskott"]}
-        if (träff.get("utskott") or "").lower() not in vill:
+    if rule.get("utskott"):
+        # Utskott codes are mixed case (JuU, SfU, MJU) because they come from
+        # the beteckning's prefix. Compare case-insensitively.
+        wanted = {u.lower() for u in rule["utskott"]}
+        if (hit.get("utskott") or "").lower() not in wanted:
             return False
-    if regel.get("sakfraga_regex"):
-        if not re.search(regel["sakfraga_regex"], träff.get("sakfraga") or "",
+    if rule.get("sakfraga_regex"):
+        if not re.search(rule["sakfraga_regex"], hit.get("sakfraga") or "",
                          re.IGNORECASE):
             return False
-    if regel.get("text_regex"):
-        blob = f"{träff.get('kontext', '')} {träff.get('text', '')}"
-        if not re.search(regel["text_regex"], blob, re.IGNORECASE):
+    if rule.get("text_regex"):
+        blob = f"{hit.get('kontext', '')} {hit.get('text', '')}"
+        if not re.search(rule["text_regex"], blob, re.IGNORECASE):
             return False
     return True
 
 
-def kör_fråga(idx, q, metod, vikt_bm25=None):
-    sok = q.get("sok", {})
-    träffar = idx.search(
+def run_question(idx, q, method, bm25_weight=None):
+    search = q.get("sok", {})
+    hits = idx.search(
         q["fraga"],
-        k=sok.get("k", 10),
-        parti=sok.get("parti"),
-        layer=sok.get("layer"),
-        per_parti=sok.get("per_parti"),
-        metod=metod,
-        vikt_bm25=vikt_bm25,
+        k=search.get("k", 10),
+        party=search.get("parti"),
+        layer=search.get("layer"),
+        per_party=search.get("per_parti"),
+        method=method,
+        bm25_weight=bm25_weight,
     )
-    metas = [m for _poäng, m in träffar]
-    flaggor = [är_relevant(m, q.get("relevant")) for m in metas]
+    metas = [m for _score, m in hits]
+    flags = [is_relevant(m, q.get("relevant")) for m in metas]
 
     res = {
-        "id": q["id"], "typ": q["typ"], "fraga": q["fraga"],
-        "n": len(metas), "n_rel": sum(flaggor),
-        "metas": metas, "flaggor": flaggor,
+        "id": q["id"], "type": q["typ"], "question": q["fraga"],
+        "n": len(metas), "n_rel": sum(flags),
+        "metas": metas, "flags": flags,
     }
-    res["precision"] = (sum(flaggor) / len(flaggor)) if flaggor else 0.0
-    res["mrr"] = next((1 / (i + 1) for i, f in enumerate(flaggor) if f), 0.0)
+    res["precision"] = (sum(flags) / len(flags)) if flags else 0.0
+    res["mrr"] = next((1 / (i + 1) for i, f in enumerate(flags) if f), 0.0)
 
     if q["typ"] == "bred":
-        hittade = set()
-        for m, f in zip(metas, flaggor):
+        found = set()
+        for m, f in zip(metas, flags):
             if f:
-                hittade |= {p for p in (m.get("parti") or "").split(";") if p}
-        vänta = set(q.get("forvantade_partier", PARTIER))
-        res["partier_hittade"] = sorted(hittade & vänta)
-        res["partier_saknade"] = sorted(vänta - hittade)
-        res["tackning"] = len(hittade & vänta) / len(vänta) if vänta else 0.0
-        # Partier som INTE ska finnas men som ändå fick en "relevant" träff.
-        res["oväntade"] = sorted(hittade - vänta)
+                found |= {p for p in (m.get("parti") or "").split(";") if p}
+        expected = set(q.get("forvantade_partier", PARTIES))
+        res["parties_found"] = sorted(found & expected)
+        res["parties_missing"] = sorted(expected - found)
+        res["coverage"] = len(found & expected) / len(expected) if expected else 0.0
+        # Parties that should NOT be there but still got a "relevant" hit.
+        res["unexpected"] = sorted(found - expected)
 
     if q["typ"] == "saknas":
-        res["falska"] = sum(flaggor)
-        res["topp"] = metas[0]["kontext"] if metas else "(inga träffar alls)"
+        res["false_hits"] = sum(flags)
+        res["top"] = metas[0]["kontext"] if metas else "(no hits at all)"
 
     if q["typ"] == "jamforelse":
-        lager = {m["layer"] for m, f in zip(metas, flaggor) if f}
-        res["lager"] = sorted(lager)
-        res["bada_lagren"] = lager == {"said", "did"}
+        layers = {m["layer"] for m, f in zip(metas, flags) if f}
+        res["layers"] = sorted(layers)
+        res["both_layers"] = layers == {"said", "did"}
 
     return res
 
 
-def sammanfatta(resultat, metod):
-    print(f"\n{'=' * 66}\nMETOD: {metod}\n{'=' * 66}")
-    per_typ = defaultdict(list)
-    for r in resultat:
-        per_typ[r["typ"]].append(r)
+def summarize(results, method):
+    print(f"\n{'=' * 66}\nMETHOD: {method}\n{'=' * 66}")
+    per_type = defaultdict(list)
+    for r in results:
+        per_type[r["type"]].append(r)
 
-    print(f"\n{'id':5}{'typ':14}{'P@k':>7}{'MRR':>7}{'täckn':>8}  anmärkning")
-    for r in resultat:
-        täck = f"{r['tackning']:.2f}" if "tackning" in r else "—"
-        anm = ""
-        if r["typ"] == "saknas":
-            anm = ("OK — inga falska träffar" if r["falska"] == 0
-                   else f"{r['falska']} FALSKA: {r['topp'][:44]}")
-        elif r["typ"] == "bred" and r.get("partier_saknade"):
-            anm = "saknas: " + ",".join(r["partier_saknade"])
-        elif r["typ"] == "jamforelse":
-            anm = "lager: " + (",".join(r["lager"]) or "inga")
+    print(f"\n{'id':5}{'type':14}{'P@k':>7}{'MRR':>7}{'cover':>8}  note")
+    for r in results:
+        cover = f"{r['coverage']:.2f}" if "coverage" in r else "—"
+        note = ""
+        if r["type"] == "saknas":
+            note = ("OK — no false hits" if r["false_hits"] == 0
+                    else f"{r['false_hits']} FALSE: {r['top'][:44]}")
+        elif r["type"] == "bred" and r.get("parties_missing"):
+            note = "missing: " + ",".join(r["parties_missing"])
+        elif r["type"] == "jamforelse":
+            note = "layers: " + (",".join(r["layers"]) or "none")
         elif r["n_rel"] == 0:
-            anm = "INGEN RELEVANT TRÄFF"
-        print(f"{r['id']:5}{r['typ']:14}{r['precision']:7.2f}{r['mrr']:7.2f}"
-              f"{täck:>8}  {anm}")
+            note = "NO RELEVANT HIT"
+        print(f"{r['id']:5}{r['type']:14}{r['precision']:7.2f}{r['mrr']:7.2f}"
+              f"{cover:>8}  {note}")
 
-    print("\nper frågetyp:")
-    for typ, rs in per_typ.items():          # alla typer som finns i setet
+    print("\nper question type:")
+    for qtype, rs in per_type.items():          # every type present in the set
         p = sum(r["precision"] for r in rs) / len(rs)
         mrr = sum(r["mrr"] for r in rs) / len(rs)
         extra = ""
-        if typ == "bred":
-            extra = f"  partitäckning {sum(r['tackning'] for r in rs) / len(rs):.2f}"
-        if typ == "saknas":
-            extra = f"  frågor utan falska träffar {sum(1 for r in rs if not r['falska'])}/{len(rs)}"
-        if typ == "jamforelse":
-            extra = f"  båda lagren {sum(1 for r in rs if r['bada_lagren'])}/{len(rs)}"
-        print(f"  {typ:14} n={len(rs):2}  P@k {p:.2f}  MRR {mrr:.2f}{extra}")
+        if qtype == "bred":
+            extra = f"  party coverage {sum(r['coverage'] for r in rs) / len(rs):.2f}"
+        if qtype == "saknas":
+            extra = f"  questions without false hits {sum(1 for r in rs if not r['false_hits'])}/{len(rs)}"
+        if qtype == "jamforelse":
+            extra = f"  both layers {sum(1 for r in rs if r['both_layers'])}/{len(rs)}"
+        print(f"  {qtype:14} n={len(rs):2}  P@k {p:.2f}  MRR {mrr:.2f}{extra}")
 
 
-def detalj(r):
-    print(f"\n--- {r['id']}  {r['fraga']}")
-    for i, (m, f) in enumerate(zip(r["metas"], r["flaggor"]), 1):
+def show_detail(r):
+    print(f"\n--- {r['id']}  {r['question']}")
+    for i, (m, f) in enumerate(zip(r["metas"], r["flags"]), 1):
         print(f"  {i:2} {'REL' if f else '   '} [{m['layer']}] {m['kontext'][:95]}")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--index", default=rag_index.INDEX_DIR)
-    ap.add_argument("--fragor", default=FRAGOR)
-    ap.add_argument("--metod", action="append",
-                    choices=["hybrid", "bm25", "vektor"])
-    ap.add_argument("--vikt-bm25", type=float, default=None,
-                    help="BM25:s vikt i RRF vid metod=hybrid")
-    ap.add_argument("--detalj", action="append", default=[],
-                    help="visa alla träffar för dessa fråge-id")
+    ap.add_argument("--questions", default=QUESTIONS_FILE)
+    ap.add_argument("--method", action="append",
+                    choices=["hybrid", "bm25", "vector"])
+    ap.add_argument("--bm25-weight", type=float, default=None,
+                    help="BM25's weight in RRF when method=hybrid")
+    ap.add_argument("--detail", action="append", default=[],
+                    help="show every hit for these question ids")
     a = ap.parse_args()
 
-    frågor = [q for q in json.load(open(a.fragor, encoding="utf-8"))
-              if q.get("relevant")]        # typer utan facit (t.ex. avrader) hoppas över
+    questions = [q for q in json.load(open(a.questions, encoding="utf-8"))
+                 if q.get("relevant")]        # types without ground truth (e.g. avrader) are skipped
     idx = rag_index.Index(a.index)
-    print(f"{idx.info['n']} passager, modell {idx.info['model']}, "
-          f"{len(frågor)} frågor")
+    print(f"{idx.info['n']} passages, model {idx.info['model']}, "
+          f"{len(questions)} questions")
 
-    for metod in (a.metod or ["hybrid"]):
-        resultat = [kör_fråga(idx, q, metod, a.vikt_bm25) for q in frågor]
-        sammanfatta(resultat, metod)
-        for r in resultat:
-            if r["id"] in a.detalj:
-                detalj(r)
+    for method in (a.method or ["hybrid"]):
+        results = [run_question(idx, q, method, a.bm25_weight) for q in questions]
+        summarize(results, method)
+        for r in results:
+            if r["id"] in a.detail:
+                show_detail(r)
 
 
 if __name__ == "__main__":

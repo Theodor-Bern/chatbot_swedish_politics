@@ -26,4 +26,4 @@ if __name__ == "__main__":
     print(agg.shape)
     print(agg.head(12).to_string(index=False))
     print("\nunika voteringar:", agg[["rm", "beteckning", "punkt"]].drop_duplicates().shape[0])
-    print("röstvärden:", sorted(agg["rost"].unique()))
+    print("vote values:", sorted(agg["rost"].unique()))

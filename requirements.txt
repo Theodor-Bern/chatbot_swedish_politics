@@ -1,0 +1,8 @@
+requests
+trafilatura
+beautifulsoup4
+sentence-transformers
+torch
+numpy
+pandas
+google-genai

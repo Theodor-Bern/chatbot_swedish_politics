@@ -1,15 +1,18 @@
 """
-party_positions.py — DID-lagret: vad partierna faktiskt GJORDE i riksdagen.
+party_positions.py — the DID layer: what the parties actually DID in the Riksdag.
 
-En votering i riksdagen ställer alltid utskottets förslag mot EN reservation.
-Rå Ja/Nej är därför oläsbart i sig: "SD röstade nej" betyder ingenting förrän
-man vet vilken reservation som var uppe. Den här filen gör två saker:
+A Riksdag vote always puts the committee's proposal against ONE reservation.
+A raw Ja/Nej is therefore unreadable on its own: "SD röstade nej" means nothing
+until you know which reservation was on the floor. This file does two things:
 
-  1. löser upp vilken reservation varje votering gällde (resolve)
-  2. formulerar resultatet i klartext (describe) — wordalisation, så att
-     LLM:en aldrig behöver tolka en siffra själv
+  1. resolves which reservation each vote was about (resolve)
+  2. states the result in plain Swedish (describe) — wordalisation, so the
+     LLM never has to interpret a number itself
 
-Kör:
+The output JSON (out/positions_did.jsonl) keeps Swedish field names
+(voteringar, reservationer, partier, …): answer.py and the tests read them.
+
+Run:
     python party_positions.py build      ->  out/positions_did.jsonl
     python party_positions.py report
     python party_positions.py ask 2022/23 AU10 1 C
@@ -29,9 +32,9 @@ VOTE_DIR = "data/voteringar"
 CHUNKS = "out/chunks.jsonl"
 OUT = "out/positions_did.jsonl"
 
-# Kolumnordningen i riksdagens votering-CSV (ingen header i filerna).
-C_RM, C_BET, C_VID, C_PUNKT = 0, 1, 2, 3
-C_PARTI, C_ROST, C_AVSER, C_DATUM = 6, 8, 9, 13
+# Column order in the Riksdag's vote CSVs (the files have no header).
+COL_RM, COL_BET, COL_VOTE_ID, COL_PUNKT = 0, 1, 2, 3
+COL_PARTY, COL_VOTE, COL_AVSER, COL_DATE = 6, 8, 9, 13
 
 PARTIES = ["S", "M", "SD", "C", "V", "KD", "MP", "L"]
 PARTY_NAMES = {
@@ -42,61 +45,61 @@ PARTY_NAMES = {
 LIVE_VOTES = ("Ja", "Nej", "Avstår")
 UTSKOTT_RE = re.compile(r"^([A-Za-zÅÄÖåäö]+)")
 
-# Hur lik partiuppsättningen måste vara för att vi ska våga gissa.
+# How similar the set of parties must be before we dare to guess.
 JACCARD_MIN = 0.34
 
 csv.field_size_limit(10_000_000)
 
 
 # --------------------------------------------------------------------------
-# inläsning
+# loading
 # --------------------------------------------------------------------------
 
 def load_votes(folder=VOTE_DIR):
-    """CSV-filerna -> {votering_id: {..., 'counts': {parti: Counter(rost)}}}.
+    """The CSV files -> {votering_id: {..., 'counts': {party: Counter(vote)}}}.
 
-    Vi nycklar på votering_id, inte på punkt: fem punkter i materialet har
-    två separata voteringar (två reservationer prövade var för sig), och de
-    ska inte slås ihop.
+    We key on votering_id, not on punkt: five punkter in the material have two
+    separate votes (two reservations tried one at a time), and they must not
+    be merged.
     """
-    voteringar = {}
+    votes = {}
     paths = sorted(glob.glob(os.path.join(folder, "*.csv")))
     if not paths:
-        sys.exit(f"hittar inga CSV-filer i {folder}")
+        sys.exit(f"no CSV files found in {folder}")
     for path in paths:
         with open(path, newline="", encoding="utf-8") as fh:
             for row in csv.reader(fh):
-                if len(row) <= C_DATUM:
+                if len(row) <= COL_DATE:
                     continue
-                vid = row[C_VID]
-                v = voteringar.get(vid)
+                vote_id = row[COL_VOTE_ID]
+                v = votes.get(vote_id)
                 if v is None:
-                    v = voteringar[vid] = {
-                        "votering_id": vid,
-                        "rm": row[C_RM],
-                        "beteckning": row[C_BET],
-                        "punkt": row[C_PUNKT].strip(),
-                        "avser": row[C_AVSER],
-                        "datum": row[C_DATUM],
+                    v = votes[vote_id] = {
+                        "votering_id": vote_id,
+                        "rm": row[COL_RM],
+                        "beteckning": row[COL_BET],
+                        "punkt": row[COL_PUNKT].strip(),
+                        "avser": row[COL_AVSER],
+                        "datum": row[COL_DATE],
                         "counts": defaultdict(Counter),
                     }
-                v["counts"][row[C_PARTI]][row[C_ROST]] += 1
-    return voteringar
+                v["counts"][row[COL_PARTY]][row[COL_VOTE]] += 1
+    return votes
 
 
 def load_reservations(chunks_path=CHUNKS):
-    """chunks.jsonl -> reservationer, kända punkter, titlar och riksmöten.
+    """chunks.jsonl -> reservations, known punkter, titles and riksmöten.
 
         res[(rm, bet, punkt)]  = [{'number': n, 'parties': frozenset}, ...]
-        punkter                = alla (rm, bet, punkt) vi känner till
-        corpus_rm              = riksmöten som faktiskt finns i korpusen
+        punkter                = every (rm, bet, punkt) we know of
+        corpus_rm              = riksmöten actually present in the corpus
     """
     res = defaultdict(list)
     punkter = set()
     titles = {}
     seen = set()
     if not os.path.exists(chunks_path):
-        sys.exit(f"hittar inte {chunks_path} — kör build_corpus.py först")
+        sys.exit(f"{chunks_path} not found — run build_corpus.py first")
 
     with open(chunks_path, encoding="utf-8") as fh:
         for line in fh:
@@ -128,14 +131,14 @@ def load_reservations(chunks_path=CHUNKS):
 
 
 # --------------------------------------------------------------------------
-# upplösning: vilken reservation gällde omröstningen?
+# resolution: which reservation was the vote about?
 # --------------------------------------------------------------------------
 
 def stance_of(counter):
-    """Partiets hållning = den röst flest av dess ledamöter lade.
+    """The party's stance = the vote most of its members cast.
 
-    Frånvaro räknas inte som en hållning; ett parti som var helt frånvarande
-    får 'Frånvarande'.
+    Absence doesn't count as a stance; a party that was entirely absent gets
+    'Frånvarande'.
     """
     live = {k: v for k, v in counter.items() if k in LIVE_VOTES and v}
     if not live:
@@ -143,10 +146,10 @@ def stance_of(counter):
     return max(live.items(), key=lambda kv: (kv[1], -LIVE_VOTES.index(kv[0])))[0]
 
 
-def nej_bloc(votering):
-    """Partierna som röstade för reservationen (dvs nej till utskottet)."""
+def no_bloc(vote):
+    """The parties that voted for the reservation (i.e. Nej to the committee)."""
     return frozenset(
-        p for p, c in votering["counts"].items()
+        p for p, c in vote["counts"].items()
         if p in PARTIES and stance_of(c) == "Nej"
     )
 
@@ -158,7 +161,7 @@ def jaccard(a, b):
 
 
 def resolve(bloc, candidates, taken, exact_only=False):
-    """Matcha nej-blocket mot reservationernas partiuppsättningar."""
+    """Match the Nej bloc against the reservations' sets of parties."""
     free = [c for c in candidates if c["number"] not in taken]
     if bloc:
         for c in free:
@@ -181,11 +184,11 @@ def resolve(bloc, candidates, taken, exact_only=False):
 # --------------------------------------------------------------------------
 
 def build(vote_dir=VOTE_DIR, chunks_path=CHUNKS, out_path=OUT):
-    voteringar = load_votes(vote_dir)
+    votes = load_votes(vote_dir)
     res, punkter, titles, corpus_rm = load_reservations(chunks_path)
 
     by_key = defaultdict(list)
-    for v in voteringar.values():
+    for v in votes.values():
         by_key[(v["rm"], v["beteckning"], v["punkt"])].append(v)
 
     stats = Counter()
@@ -197,24 +200,23 @@ def build(vote_dir=VOTE_DIR, chunks_path=CHUNKS, out_path=OUT):
         cands = res.get(key, [])
         vs = sorted(by_key.get(key, []), key=lambda v: (v["avser"], v["votering_id"]))
 
-        sak = [v for v in vs if v["avser"] == "sakfrågan"]
+        issue_votes = [v for v in vs if v["avser"] == "sakfrågan"]
         taken = set()
         assigned = {}
-        # Två pass: exakta matchningar först, så att en partiell gissning
-        # inte kan lägga beslag på en reservation som hör till en annan
-        # omröstning på samma punkt.
+        # Two passes: exact matches first, so a partial guess can't claim a
+        # reservation that belongs to another vote on the same punkt.
         for pass_exact in (True, False):
-            for v in sak:
+            for v in issue_votes:
                 if v["votering_id"] in assigned:
                     continue
-                c, how = resolve(nej_bloc(v), cands, taken, exact_only=pass_exact)
+                c, how = resolve(no_bloc(v), cands, taken, exact_only=pass_exact)
                 if c is None and pass_exact:
                     continue
                 assigned[v["votering_id"]] = (c, how)
                 if c:
                     taken.add(c["number"])
 
-        out_voteringar = []
+        out_votes = []
         for v in vs:
             if v["rm"] not in corpus_rm:
                 c, how = None, "utanfor_korpus"
@@ -223,14 +225,14 @@ def build(vote_dir=VOTE_DIR, chunks_path=CHUNKS, out_path=OUT):
             else:
                 c, how = None, "motivfraga"
             stats[how] += 1
-            out_voteringar.append({
+            out_votes.append({
                 "votering_id": v["votering_id"],
                 "datum": v["datum"],
                 "avser": v["avser"],
                 "reservation": c["number"] if c else None,
                 "reservation_partier": sorted(c["parties"]) if c else [],
                 "resolution": how,
-                "nej_bloc": sorted(nej_bloc(v)),
+                "nej_bloc": sorted(no_bloc(v)),
                 "partier": {
                     p: {
                         "stance": stance_of(v["counts"][p]),
@@ -251,11 +253,11 @@ def build(vote_dir=VOTE_DIR, chunks_path=CHUNKS, out_path=OUT):
             "punkt": punkt,
             "utskott": m.group(1).upper() if m else "",
             "doc_title": titles.get((rm, bet), ""),
-            "status": "voted" if out_voteringar else "no_vote",
+            "status": "voted" if out_votes else "no_vote",
             "reservationer": [
                 {"number": c["number"], "partier": sorted(c["parties"])} for c in cands
             ],
-            "voteringar": out_voteringar,
+            "voteringar": out_votes,
         })
         stats["punkter"] += 1
         stats["punkter_" + rows[-1]["status"]] += 1
@@ -269,109 +271,109 @@ def build(vote_dir=VOTE_DIR, chunks_path=CHUNKS, out_path=OUT):
 
 
 # --------------------------------------------------------------------------
-# wordalisation
+# wordalisation (Swedish sentences: they go into Gemini's prompt)
 # --------------------------------------------------------------------------
 
-def _mot(v):
-    """Hur omröstningen ska benämnas."""
+def _reservation_label(v):
+    """How the vote is referred to."""
     if v["reservation"] is None:
         return "en reservation som inte kunnat identifieras", []
-    part = ", ".join(v["reservation_partier"])
-    txt = f"reservation {v['reservation']} ({part})"
+    parties = ", ".join(v["reservation_partier"])
+    txt = f"reservation {v['reservation']} ({parties})"
     if v["resolution"] == "partial":
         txt += " [trolig matchning]"
     return txt, v["reservation_partier"]
 
 
-def _mening(parti, v, info):
-    """En mening om vad partiet gjorde i en enskild omröstning."""
-    mot, res_partier = _mot(v)
-    egen = parti in res_partier
+def _sentence(party, v, info):
+    """One sentence about what the party did in a single vote."""
+    label, res_parties = _reservation_label(v)
+    own = party in res_parties
     stance = info["stance"]
 
-    if stance == "Nej" and egen:
-        andra = [p for p in res_partier if p != parti]
-        s = f"{parti} röstade för sin egen reservation {v['reservation']}"
-        if andra:
-            s += f", som partiet står bakom tillsammans med {', '.join(andra)}"
+    if stance == "Nej" and own:
+        others = [p for p in res_parties if p != party]
+        s = f"{party} röstade för sin egen reservation {v['reservation']}"
+        if others:
+            s += f", som partiet står bakom tillsammans med {', '.join(others)}"
         if v["resolution"] == "partial":
             s += " [trolig matchning]"
         s += "."
     elif stance == "Nej":
-        s = f"{parti} röstade för {mot}."
-    elif stance == "Ja" and egen:
-        s = (f"{parti} röstade med utskottets majoritet mot {mot} — "
+        s = f"{party} röstade för {label}."
+    elif stance == "Ja" and own:
+        s = (f"{party} röstade med utskottets majoritet mot {label} — "
              f"trots att partiet självt står bakom den.")
     elif stance == "Ja":
-        s = f"{parti} röstade med utskottets majoritet mot {mot}."
+        s = f"{party} röstade med utskottets majoritet mot {label}."
     elif stance == "Avstår":
-        s = f"{parti} avstod i omröstningen om {mot}."
+        s = f"{party} avstod i omröstningen om {label}."
     else:
-        s = f"{parti} var frånvarande i omröstningen om {mot}."
+        s = f"{party} var frånvarande i omröstningen om {label}."
 
-    avlagda = [(info["ja"], "ja"), (info["nej"], "nej"), (info["avstod"], "avstod")]
-    if sum(1 for n, _ in avlagda if n) > 1:
-        delar = ", ".join(f"{n} {ord_}" for n, ord_ in avlagda if n)
-        s += f" Partiet var splittrat: {delar}."
+    cast = [(info["ja"], "ja"), (info["nej"], "nej"), (info["avstod"], "avstod")]
+    if sum(1 for n, _ in cast if n) > 1:
+        parts = ", ".join(f"{n} {word}" for n, word in cast if n)
+        s += f" Partiet var splittrat: {parts}."
     return s
 
 
-def describe(row, parti):
-    """Klartext om vad ett parti gjorde på en punkt.
+def describe(row, party):
+    """Plain Swedish on what a party did on a punkt.
 
-    Returnerar {'status', 'text', 'egna_reservationer'}. "Ingen votering hölls"
-    är ett fullvärdigt svar, inte ett fel — omkring två tredjedelar av
-    punkterna avgörs med acklamation.
+    Returns {'status', 'text', 'own_reservations'}. "Ingen votering hölls" is
+    a full answer, not an error — about two thirds of the punkter are decided
+    by acclamation.
     """
-    namn = PARTY_NAMES.get(parti, parti)
-    var = f"{row['beteckning']} ({row['rm']}) punkt {row['punkt']}"
-    egna = [r["number"] for r in row["reservationer"] if parti in r["partier"]]
+    name = PARTY_NAMES.get(party, party)
+    where = f"{row['beteckning']} ({row['rm']}) punkt {row['punkt']}"
+    own = [r["number"] for r in row["reservationer"] if party in r["partier"]]
 
     if row["status"] == "no_vote":
-        text = (f"Ingen votering hölls på {var}; ärendet avgjordes med acklamation. "
-                f"{namn} tog därför inte ställning i en omröstning.")
-        if egna:
+        text = (f"Ingen votering hölls på {where}; ärendet avgjordes med acklamation. "
+                f"{name} tog därför inte ställning i en omröstning.")
+        if own:
             text += (f" Partiet hade dock reservation "
-                     f"{', '.join(str(n) for n in egna)} på punkten.")
-        return {"status": "no_vote", "text": text, "egna_reservationer": egna}
+                     f"{', '.join(str(n) for n in own)} på punkten.")
+        return {"status": "no_vote", "text": text, "own_reservations": own}
 
-    meningar = []
-    prövade = set()
+    sentences = []
+    voted_on = set()
     for v in row["voteringar"]:
-        info = v["partier"].get(parti)
+        info = v["partier"].get(party)
         if info is None:
             continue
         if v["resolution"] == "utanfor_korpus":
-            meningar.append(
-                f"{parti} deltog i en omröstning på {var} den {v['datum']}, "
+            sentences.append(
+                f"{party} deltog i en omröstning på {where} den {v['datum']}, "
                 f"men betänkandet för {row['rm']} ingår inte i materialet, "
                 f"så vilken reservation omröstningen gällde är okänt."
             )
             continue
         if v["avser"] == "motivfrågan":
-            meningar.append(
-                f"{parti} {'röstade för' if info['stance'] == 'Nej' else 'röstade mot'} "
-                f"en motivreservation på {var} (omröstningen gällde motiveringen, "
+            sentences.append(
+                f"{party} {'röstade för' if info['stance'] == 'Nej' else 'röstade mot'} "
+                f"en motivreservation på {where} (omröstningen gällde motiveringen, "
                 f"inte sakfrågan)."
             )
             continue
         if v["reservation"] is not None:
-            prövade.add(v["reservation"])
-        meningar.append(_mening(parti, v, info))
+            voted_on.add(v["reservation"])
+        sentences.append(_sentence(party, v, info))
 
-    if not meningar:
+    if not sentences:
         return {"status": "no_vote",
-                "text": f"{namn} deltog inte i någon omröstning på {var}.",
-                "egna_reservationer": egna}
+                "text": f"{name} deltog inte i någon omröstning på {where}.",
+                "own_reservations": own}
 
-    orörda = [n for n in egna if n not in prövade]
-    if orörda:
-        meningar.append(
-            f"{parti} hade en egen reservation "
-            f"({', '.join(str(n) for n in orörda)}) på punkten, "
+    untouched = [n for n in own if n not in voted_on]
+    if untouched:
+        sentences.append(
+            f"{party} hade en egen reservation "
+            f"({', '.join(str(n) for n in untouched)}) på punkten, "
             f"som inte var uppe i denna omröstning."
         )
-    return {"status": "voted", "text": " ".join(meningar), "egna_reservationer": egna}
+    return {"status": "voted", "text": " ".join(sentences), "own_reservations": own}
 
 
 # --------------------------------------------------------------------------
@@ -380,16 +382,17 @@ def describe(row, parti):
 
 def load_positions(path=OUT):
     if not os.path.exists(path):
-        sys.exit(f"hittar inte {path} — kör 'python {sys.argv[0]} build' först")
-    return {json.loads(l)["key"]: json.loads(l) for l in open(path, encoding="utf-8")}
+        sys.exit(f"{path} not found — run 'python {sys.argv[0]} build' first")
+    with open(path, encoding="utf-8") as fh:
+        return {(d := json.loads(line))["key"]: d for line in fh}
 
 
-def ask(positions, rm, beteckning, punkt, parti):
+def ask(positions, rm, beteckning, punkt, party):
     row = positions.get(f"{rm}|{beteckning}|{punkt}")
     if row is None:
         return {"status": "unknown_punkt",
                 "text": f"Punkt {punkt} i {beteckning} ({rm}) finns inte i materialet."}
-    return describe(row, parti)
+    return describe(row, party)
 
 
 # --------------------------------------------------------------------------
@@ -399,22 +402,22 @@ def ask(positions, rm, beteckning, punkt, parti):
 def cmd_build():
     rows, stats = build()
     tot = stats["exact"] + stats["partial"] + stats["unknown"]
-    print(f"skrev {OUT}  ({len(rows)} punkter)")
-    print(f"  med votering   {stats['punkter_voted']}")
-    print(f"  acklamation    {stats['punkter_no_vote']}")
-    print(f"\nsakfrågevoteringar inom korpusen: {tot}")
+    print(f"wrote {OUT}  ({len(rows)} punkter)")
+    print(f"  with a vote     {stats['punkter_voted']}")
+    print(f"  acclamation     {stats['punkter_no_vote']}")
+    print(f"\nissue votes within the corpus: {tot}")
     for k in ("exact", "partial", "unknown"):
         n = stats[k]
         print(f"  {k:9} {n:6}  {n / tot * 100:5.1f}%" if tot else f"  {k}: {n}")
-    print(f"motivfrågevoteringar: {stats['motivfraga']}")
+    print(f"reasoning (motivfråga) votes: {stats['motivfraga']}")
     if stats["utanfor_korpus"]:
-        print(f"\nvoteringar utanför korpusen: {stats['utanfor_korpus']}"
-              f"  (riksmöten det saknas betänkanden för)")
+        print(f"\nvotes outside the corpus: {stats['utanfor_korpus']}"
+              f"  (riksmöten with no betänkanden in the material)")
 
 
 def cmd_report():
     positions = load_positions()
-    per_parti = Counter()
+    per_party = Counter()
     per_utskott = Counter()
     for row in positions.values():
         for v in row["voteringar"]:
@@ -423,11 +426,11 @@ def cmd_report():
             per_utskott[row["utskott"]] += 1
             for p, info in v["partier"].items():
                 if info["stance"] in LIVE_VOTES:
-                    per_parti[p] += 1
-    print("voteringar där partiet tog ställning:")
+                    per_party[p] += 1
+    print("votes where the party took a stance:")
     for p in PARTIES:
-        print(f"  {p:3} {per_parti[p]:6}")
-    print("\nvoteringar per utskott (topp 12):")
+        print(f"  {p:3} {per_party[p]:6}")
+    print("\nvotes per utskott (top 12):")
     for u, n in per_utskott.most_common(12):
         print(f"  {u:5} {n:5}")
 
@@ -442,8 +445,8 @@ def main():
         cmd_report()
     elif cmd == "ask":
         if len(sys.argv) != 6:
-            sys.exit("ask <rm> <beteckning> <punkt> <parti>   "
-                     "t.ex. ask 2022/23 AU10 1 C")
+            sys.exit("ask <rm> <beteckning> <punkt> <party>   "
+                     "e.g. ask 2022/23 AU10 1 C")
         positions = load_positions()
         print(ask(positions, *sys.argv[2:6])["text"])
     else:

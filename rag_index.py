@@ -1,25 +1,26 @@
 """
-rag_index.py — bygger och söker i det gemensamma indexet över båda lagren.
+rag_index.py — builds and searches the shared index over all three layers.
 
-SAID  = vad partierna säger på sina hemsidor   (out/positions_said_*.jsonl)
-DID   = vad som står i riksdagens betänkanden  (out/chunks.jsonl)
+SAID    = what the parties say on their websites  (out/positions_said_*.jsonl)
+DID     = what's in the Riksdag's committee reports (out/chunks.jsonl)
+MOTION  = the parties' formal proposals            (out/motion_chunks.jsonl)
 
-Varje passage får en kontextrad före själva texten. Kontextraden är en
-wordalisation av metadatan — "Reservation 1 (C) i AU10, 2022/23, punkt 1" —
-så att både embeddingen och LLM:en ser vad texten ÄR, inte bara vad den säger.
+Every passage gets a context line in front of its text. The context line is a
+wordalisation of the metadata — "Reservation 1 (C) — AU10 2022/23 punkt 1" —
+so both the embedding and the LLM see what the text IS, not just what it says.
+The context lines are Swedish on purpose: they are embedded together with the
+Swedish text, and changing them changes every vector.
 
-Sökningen är hybrid: BM25 (exakta ord, beteckningar, siffror) och vektorer
-(betydelse) slås ihop med viktad Reciprocal Rank Fusion. Träffarna kvoteras
-per parti, annars äter ett ordrikt parti hela kontextfönstret och
-"jämförelsen" blir en sammanfattning av det parti som skriver mest.
+Search is hybrid: BM25 (exact words, beteckningar, numbers) and vectors
+(meaning) are merged with weighted Reciprocal Rank Fusion.
 
-Kör:
-    python rag_index.py build                      # ~20 min med e5-small
-    python rag_index.py build --stub               # rökttest utan modell
-    python rag_index.py build --bara-bm25          # bygg om BM25, behåll vektorer
+Run:
+    python rag_index.py build                      # embeds only new/changed passages
+    python rag_index.py build --stub               # smoke test without a model
+    python rag_index.py build --bm25-only          # rebuild BM25, keep vectors
     python rag_index.py search "vinster i välfärden"
-    python rag_index.py search "klimat" --parti V,SD --per-parti 3
-    python rag_index.py search "AU10 2022/23" --metod bm25 --layer did
+    python rag_index.py search "klimat" --party V,SD --per-party 3
+    python rag_index.py search "AU10 2022/23" --method bm25 --layer did
     python rag_index.py shell
 """
 
@@ -27,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import math
 import os
@@ -37,162 +39,206 @@ from collections import Counter, defaultdict
 
 SAID_GLOB = "out/positions_said_*.jsonl"
 DID_CHUNKS = "out/chunks.jsonl"
+MOTION_CHUNKS = "out/motion_chunks.jsonl"
 INDEX_DIR = "out/index"
 
 MODEL_NAME = "intfloat/multilingual-e5-large"
 BATCH = 32
 
-# Passagelängd. e5 klipper vid 512 tokens ≈ 1 600 tecken svenska; vi håller
-# oss under det med marginal och låter styckena överlappa så att en mening
-# inte kan hamna mellan två passager.
+# Passage length. e5 truncates at 512 tokens ≈ 1,600 characters of Swedish; we
+# stay well under that and let pieces overlap so a sentence can't fall between
+# two passages.
 MAX_CHARS = 1200
 OVERLAP = 150
 RRF_K = 60
-# RRF väger normalt de två listorna lika. Vår utvärdering visar att BM25 är
-# klart svagare än vektorlistan på naturligt formulerade frågor, och att en
-# likaviktad sammanslagning då DRAR NER resultatet under ren vektorsökning.
-# BM25 får därför lägre vikt: den ska rädda identifierarsökningar
-# ("AU10 2022/23", "reservation 14"), inte styra ämnessökningen.
-RRF_VIKT_BM25 = 0.35
-RRF_VIKT_VEKTOR = 1.0
+# RRF normally weights the two lists equally. Our evaluation shows BM25 is
+# clearly weaker than the vector list on naturally phrased questions, and an
+# equally weighted merge then PULLS the result below pure vector search.
+# BM25 therefore gets a lower weight: it's there to rescue identifier lookups
+# ("AU10 2022/23", "reservation 14"), not to drive topical ranking.
+RRF_WEIGHT_BM25 = 0.35
+RRF_WEIGHT_VECTOR = 1.0
 
 PARTY_NAMES = {
     "S": "Socialdemokraterna", "M": "Moderaterna", "SD": "Sverigedemokraterna",
     "C": "Centerpartiet", "V": "Vänsterpartiet", "KD": "Kristdemokraterna",
     "MP": "Miljöpartiet", "L": "Liberalerna",
 }
+# Swedish section labels for the DID context line (embedded text — keep as is).
 SECTION_SV = {
     "summary": "Sammanfattning", "decision": "Utskottets förslag till beslut",
     "deliberation": "Utskottets överväganden", "reservation": "Reservation",
     "dissent": "Särskilt yttrande",
 }
 
-# Ord som bara skapar brus i BM25. Medvetet kort — vi vill inte råka
-# filtrera bort politiskt laddade ord.
-STOPP = set("""och att det som en för av på är den till med de i om så har inte
+# Swedish words that only add noise in BM25. Deliberately short — we don't
+# want to accidentally filter out politically loaded words.
+STOPWORDS = set("""och att det som en för av på är den till med de i om så har inte
 den där vi men kan ska har hade blir blev vara var vid ett den denna detta dessa
 under efter mot från utan även samt då när där vilket vilka man sig sin sitt
 dess deras våra vår vårt eller än mer mest också bara alla andra""".split())
 
 WORD_RE = re.compile(r"[a-zåäöéA-ZÅÄÖÉ0-9]+")
 
-# Partinamn är brus i söksträngen så snart partiet är ett metadatafilter:
-# ordet "miljöpartiet" står på nästan varje mp.se-sida och dränker ämnesordet.
-PARTINAMN = set()
-for _k, _v in PARTY_NAMES.items():
-    PARTINAMN |= {_k.lower(), _v.lower()}
-PARTINAMN |= {"moderata", "samlingspartiet", "socialdemokrater",
-              "sverigedemokrater", "kristdemokrater", "centern", "partiet"}
+# Party names are noise in the query as soon as the party is a metadata
+# filter: the word "miljöpartiet" is on almost every mp.se page and drowns
+# out the topic word.
+PARTY_NAME_WORDS = set()
+for _code, _name in PARTY_NAMES.items():
+    PARTY_NAME_WORDS |= {_code.lower(), _name.lower()}
+PARTY_NAME_WORDS |= {"moderata", "samlingspartiet", "socialdemokrater",
+                     "sverigedemokrater", "kristdemokrater", "centern", "partiet"}
 
-# Lätt svensk stamning. Ordnad längst först; vi kapar bara om stammen blir
-# minst fyra tecken, så "det" och "stat" lämnas i fred.
-SUFFIX = ["ernas", "arnas", "ornas", "andet", "arna", "erna", "orna",
-          "ande", "ende", "aste", "ades", "ade", "are", "ast", "ens",
-          "ets", "er", "ar", "or", "en", "et", "na", "as", "es"]
-MIN_STAM = 4
+# Light Swedish stemming. Ordered longest first; we only cut if the stem
+# keeps at least four characters, so "det" and "stat" are left alone.
+SUFFIXES = ["ernas", "arnas", "ornas", "andet", "arna", "erna", "orna",
+            "ande", "ende", "aste", "ades", "ade", "are", "ast", "ens",
+            "ets", "er", "ar", "or", "en", "et", "na", "as", "es"]
+MIN_STEM = 4
 
 
-def stam(ord_):
-    for suf in SUFFIX:
-        if ord_.endswith(suf) and len(ord_) - len(suf) >= MIN_STAM:
-            return ord_[: -len(suf)]
-    return ord_
+def stem(word):
+    for suffix in SUFFIXES:
+        if word.endswith(suffix) and len(word) - len(suffix) >= MIN_STEM:
+            return word[: -len(suffix)]
+    return word
+
+
+YRKANDE_WRAPPER_PATTERNS = [
+    re.compile(
+        r"^Riksdagen ställer sig bakom det som anförs i motionen om (att )?"
+        r"(?P<core>.+?)"
+        r"[,.]?\s*och\s+(detta\s+tillkännager\s+riksdagen|tillkännager\s+detta)\s+för\s+regeringen\.?\s*$",
+        re.IGNORECASE),
+    re.compile(
+        r"^Riksdagen avslår regeringens förslag\s+"
+        r"(avseende|i\s+den\s+del\s+som\s+avser)\s+"
+        r"(?P<core>.+?)\.?\s*$",
+        re.IGNORECASE),
+]
+
+
+def yrkande_core(text):
+    """Strips the boilerplate ('Riksdagen ställer sig bakom...') from a
+    yrkande, to leave the embedding more room for the actual content."""
+    for pattern in YRKANDE_WRAPPER_PATTERNS:
+        m = pattern.match(text)
+        if m:
+            return m.group("core").strip()
+    return text
 
 
 # --------------------------------------------------------------------------
-# 1. läs in och normalisera båda lagren
+# 1. load and normalise all layers
 # --------------------------------------------------------------------------
 
 def split_text(text, max_chars=MAX_CHARS, overlap=OVERLAP):
-    """Dela lång text på stycke- och meningsgränser, aldrig mitt i ett ord."""
+    """Split long text at paragraph and sentence boundaries, never mid-word."""
     text = text.strip()
     if len(text) <= max_chars:
         return [text] if text else []
 
-    # Först på styckegränser, sedan på meningsgränser om ett stycke är för långt.
-    bitar = []
-    for stycke in re.split(r"\n\s*\n", text):
-        stycke = stycke.strip()
-        if not stycke:
+    # Paragraph boundaries first, then sentence boundaries if a paragraph is too long.
+    pieces = []
+    for paragraph in re.split(r"\n\s*\n", text):
+        paragraph = paragraph.strip()
+        if not paragraph:
             continue
-        if len(stycke) <= max_chars:
-            bitar.append(stycke)
+        if len(paragraph) <= max_chars:
+            pieces.append(paragraph)
             continue
-        meningar = re.split(r"(?<=[.!?])\s+", stycke)
+        sentences = re.split(r"(?<=[.!?])\s+", paragraph)
         buf = ""
-        for m in meningar:
-            while len(m) > max_chars:          # en enda jättemening
-                bitar.append(m[:max_chars])
-                m = m[max_chars - overlap:]
-            if len(buf) + len(m) + 1 <= max_chars:
-                buf = f"{buf} {m}".strip()
+        for s in sentences:
+            while len(s) > max_chars:          # one giant sentence
+                pieces.append(s[:max_chars])
+                s = s[max_chars - overlap:]
+            if len(buf) + len(s) + 1 <= max_chars:
+                buf = f"{buf} {s}".strip()
             else:
                 if buf:
-                    bitar.append(buf)
-                buf = m
+                    pieces.append(buf)
+                buf = s
         if buf:
-            bitar.append(buf)
+            pieces.append(buf)
 
-    # Slå ihop småbitar och lägg på överlapp.
-    ut = []
+    # Merge small pieces and add the overlap.
+    out = []
     buf = ""
-    for b in bitar:
-        if len(buf) + len(b) + 2 <= max_chars:
-            buf = f"{buf}\n\n{b}".strip()
+    for p in pieces:
+        if len(buf) + len(p) + 2 <= max_chars:
+            buf = f"{buf}\n\n{p}".strip()
         else:
             if buf:
-                ut.append(buf)
-            buf = b
+                out.append(buf)
+            buf = p
     if buf:
-        ut.append(buf)
+        out.append(buf)
 
-    if overlap and len(ut) > 1:
-        med_overlap = [ut[0]]
-        for i in range(1, len(ut)):
-            svans = ut[i - 1][-overlap:]
-            mellanslag = svans.find(" ")          # kapa fram till ordgräns
-            svans = svans[mellanslag + 1:] if mellanslag != -1 else ""
-            med_overlap.append(f"{svans} {ut[i]}".strip())
-        ut = med_overlap
-    return ut
+    if overlap and len(out) > 1:
+        with_overlap = [out[0]]
+        for i in range(1, len(out)):
+            tail = out[i - 1][-overlap:]
+            space = tail.find(" ")          # cut forward to a word boundary
+            tail = tail[space + 1:] if space != -1 else ""
+            with_overlap.append(f"{tail} {out[i]}".strip())
+        out = with_overlap
+    return out
 
 
 def said_context(d):
-    parti = d.get("parti", "")
-    namn = PARTY_NAMES.get(parti, parti)
-    rubrik = d.get("heading") or d.get("sakfraga") or ""
-    return f"{namn} ({parti}) om {d.get('sakfraga', '')}: {rubrik}".strip()
+    party = d.get("parti", "")
+    name = PARTY_NAMES.get(party, party)
+    heading = d.get("heading") or d.get("sakfraga") or ""
+    ctx = f"{name} ({party}) om {d.get('sakfraga', '')}: {heading}".strip()
+    # The party's own A–Ö labels ("Artificiell intelligens, AI" on the page
+    # "Digitalisering") — in the context line so every piece of a split page gets them.
+    extra = [label for label in d.get("labels", []) if label.lower() != heading.lower()]
+    return f"{ctx} ({'; '.join(extra)})" if extra else ctx
 
 
 def did_context(d):
-    sek = SECTION_SV.get(d.get("section", ""), d.get("section", ""))
-    bitar = [sek]
+    section = SECTION_SV.get(d.get("section", ""), d.get("section", ""))
+    parts = [section]
     if d.get("section") in ("reservation", "dissent") and d.get("number"):
-        bitar[0] = f"{sek} {d['number']}"
-    partier = [p for p in str(d.get("parties") or "").split(";") if p]
-    if partier:
-        bitar[0] += f" ({', '.join(partier)})"
-    var = f"{d.get('beteckning', '')} {d.get('rm', '')}"
+        parts[0] = f"{section} {d['number']}"
+    parties = [p for p in str(d.get("parties") or "").split(";") if p]
+    if parties:
+        parts[0] += f" ({', '.join(parties)})"
+    where = f"{d.get('beteckning', '')} {d.get('rm', '')}"
     if d.get("punkter"):
-        var += f" punkt {d['punkter']}"
-    bitar.append(var.strip())
+        where += f" punkt {d['punkter']}"
+    parts.append(where.strip())
     if d.get("doc_title"):
-        bitar.append(d["doc_title"])
+        parts.append(d["doc_title"])
     if d.get("heading"):
-        bitar.append(d["heading"])
-    return " — ".join(b for b in bitar if b)
+        parts.append(d["heading"])
+    return " — ".join(p for p in parts if p)
+
+
+def motion_context(d):
+    party = d.get("parti", "")
+    name = PARTY_NAMES.get(party, party)
+    ctx = f"{name} ({party}), motion {d.get('beteckning', '')} {d.get('rm', '')}"
+    if d.get("heading"):
+        ctx += f", om {d['heading']}"
+    return ctx.strip()
 
 
 def load_records():
-    """Båda lagren -> en lista av passager med gemensamt schema."""
-    poster = []
+    """All layers -> one list of passages with a shared schema.
+
+    The JSON field names (parti, kontext, sakfraga, …) are the index's data
+    schema and stay Swedish: meta.jsonl and every reader of it depend on them.
+    """
+    records = []
 
     for path in sorted(glob.glob(SAID_GLOB)):
         for line in open(path, encoding="utf-8"):
             d = json.loads(line)
             ctx = said_context(d)
-            for i, bit in enumerate(split_text(d.get("text", ""))):
-                poster.append({
+            for i, piece in enumerate(split_text(d.get("text", ""))):
+                records.append({
                     "id": f"{d['chunk_id']}#{i}",
                     "parent": d["chunk_id"],
                     "layer": "said",
@@ -201,19 +247,19 @@ def load_records():
                     "url": d.get("url", ""),
                     "lastmod": d.get("lastmod"),
                     "kontext": ctx,
-                    "text": bit,
+                    "text": piece,
                 })
 
     for line in open(DID_CHUNKS, encoding="utf-8"):
         d = json.loads(line)
         ctx = did_context(d)
-        partier = [p for p in str(d.get("parties") or "").split(";") if p]
-        for i, bit in enumerate(split_text(d.get("text", ""))):
-            poster.append({
+        parties = [p for p in str(d.get("parties") or "").split(";") if p]
+        for i, piece in enumerate(split_text(d.get("text", ""))):
+            records.append({
                 "id": f"{d['chunk_id']}#{i}",
                 "parent": d["chunk_id"],
                 "layer": "did",
-                "parti": ";".join(partier),
+                "parti": ";".join(parties),
                 "section": d.get("section", ""),
                 "rm": d.get("rm", ""),
                 "beteckning": d.get("beteckning", ""),
@@ -223,36 +269,60 @@ def load_records():
                 "doc_title": d.get("doc_title", ""),
                 "doc_verdict": d.get("doc_verdict", ""),
                 "kontext": ctx,
-                "text": bit,
+                "text": piece,
             })
-    return poster
+
+    if os.path.exists(MOTION_CHUNKS):
+        for line in open(MOTION_CHUNKS, encoding="utf-8"):
+            d = json.loads(line)
+            ctx = motion_context(d)
+            for i, piece in enumerate(split_text(d.get("text", ""))):
+                records.append({
+                    "id": f"{d['chunk_id']}#{i}",
+                    "parent": d["chunk_id"],
+                    "layer": "motion",
+                    "parti": d.get("parti", ""),
+                    "rm": d.get("rm", ""),
+                    "beteckning": d.get("beteckning", ""),
+                    "doc_title": d.get("doc_title", ""),
+                    "heading": d.get("heading", ""),
+                    "sektion_text": d.get("sektion_text", ""),
+                    "yrkande_nr": d.get("yrkande_nr", 0),
+                    "undertecknare": d.get("undertecknare", ""),
+                    "kontext": ctx,
+                    "text": piece,
+                    "extra_bm25": d.get("sektion_text", ""),
+                })
+    return records
 
 
 def passage_text(p):
-    """Det som faktiskt embeddas: kontextraden och sedan texten."""
-    return f"passage: {p['kontext']}\n{p['text']}"
+    """What actually gets embedded: the context line, then the text.
+    For motions the boilerplate is stripped from the yrkande."""
+    text = yrkande_core(p["text"]) if p.get("layer") == "motion" else p["text"]
+    return f"passage: {p['kontext']}\n{text}"
 
 
 # --------------------------------------------------------------------------
 # 2. BM25
 # --------------------------------------------------------------------------
 
-def tokenize(s, ta_bort_partinamn=False):
-    ord_ = (t.lower() for t in WORD_RE.findall(s))
-    ord_ = (w for w in ord_ if w not in STOPP)
-    if ta_bort_partinamn:
-        ord_ = (w for w in ord_ if w not in PARTINAMN)
-    return [stam(w) for w in ord_]
+def tokenize(s, drop_party_names=False):
+    words = (t.lower() for t in WORD_RE.findall(s))
+    words = (w for w in words if w not in STOPWORDS)
+    if drop_party_names:
+        words = (w for w in words if w not in PARTY_NAME_WORDS)
+    return [stem(w) for w in words]
 
 
 class BM25:
-    """Standard BM25 med inverterat index. Ren stdlib — inget beroende."""
+    """Standard BM25 with an inverted index. Pure stdlib — no dependency."""
 
     def __init__(self, docs, k1=1.5, b=0.75):
         self.k1, self.b = k1, b
         self.N = len(docs)
-        self.längder = [len(d) for d in docs]
-        self.medel = sum(self.längder) / self.N if self.N else 0.0
+        self.lengths = [len(d) for d in docs]
+        self.avg_len = sum(self.lengths) / self.N if self.N else 0.0
         self.inv = defaultdict(list)          # term -> [(doc_idx, tf), ...]
         df = Counter()
         for i, d in enumerate(docs):
@@ -263,13 +333,15 @@ class BM25:
             t: math.log(1 + (self.N - n + 0.5) / (n + 0.5)) for t, n in df.items()
         }
 
-    # Vi picklar data, inte objektet. Ett picklat objekt går bara att läsa
-    # tillbaka från samma modul det skapades i — annars kraschar importen
-    # med "Can't get attribute 'BM25' on <module '__main__'>".
+    # We pickle data, not the object. A pickled object can only be read back
+    # from the same module it was created in — otherwise the import crashes
+    # with "Can't get attribute 'BM25' on <module '__main__'>".
+    # The keys "längder"/"medel" are the on-disk format of bm25.pkl; renaming
+    # them would break every existing index file.
     def save(self, path):
         with open(path, "wb") as fh:
             pickle.dump({"k1": self.k1, "b": self.b, "N": self.N,
-                         "längder": self.längder, "medel": self.medel,
+                         "längder": self.lengths, "medel": self.avg_len,
                          "inv": dict(self.inv), "idf": self.idf},
                         fh, protocol=4)
 
@@ -278,20 +350,20 @@ class BM25:
         d = pickle.load(open(path, "rb"))
         o = cls.__new__(cls)
         o.k1, o.b, o.N = d["k1"], d["b"], d["N"]
-        o.längder, o.medel = d["längder"], d["medel"]
+        o.lengths, o.avg_len = d["längder"], d["medel"]
         o.inv, o.idf = d["inv"], d["idf"]
         return o
 
-    def search(self, query, limit=200, ta_bort_partinamn=False):
-        poäng = defaultdict(float)
-        for term in tokenize(query, ta_bort_partinamn):
+    def search(self, query, limit=200, drop_party_names=False):
+        scores = defaultdict(float)
+        for term in tokenize(query, drop_party_names):
             idf = self.idf.get(term)
             if idf is None:
                 continue
             for i, tf in self.inv.get(term, ()):
-                norm = 1 - self.b + self.b * self.längder[i] / self.medel
-                poäng[i] += idf * tf * (self.k1 + 1) / (tf + self.k1 * norm)
-        return sorted(poäng.items(), key=lambda kv: -kv[1])[:limit]
+                norm = 1 - self.b + self.b * self.lengths[i] / self.avg_len
+                scores[i] += idf * tf * (self.k1 + 1) / (tf + self.k1 * norm)
+        return sorted(scores.items(), key=lambda kv: -kv[1])[:limit]
 
 
 # --------------------------------------------------------------------------
@@ -299,7 +371,7 @@ class BM25:
 # --------------------------------------------------------------------------
 
 def stub_vectors(texts, dim=256):
-    """Deterministisk fejk-encoder för rökttest. INTE semantisk."""
+    """Deterministic fake encoder for smoke tests. NOT semantic."""
     import numpy as np
     v = np.zeros((len(texts), dim), dtype="float32")
     for i, t in enumerate(texts):
@@ -314,11 +386,11 @@ def encode(texts, stub=False, model_name=MODEL_NAME):
         return stub_vectors(texts)
     from sentence_transformers import SentenceTransformer
     import torch
-    enhet = "mps" if torch.backends.mps.is_available() else "cpu"
-    print(f"laddar {model_name} på {enhet} …")
-    modell = SentenceTransformer(model_name, device=enhet)
-    modell.max_seq_length = 384    # ~1 200 tecken svenska ryms; default 512
-    return modell.encode(
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    print(f"loading {model_name} on {device} …")
+    model = SentenceTransformer(model_name, device=device)
+    model.max_seq_length = 384    # ~1,200 characters of Swedish fit; default 512
+    return model.encode(
         texts, batch_size=BATCH, normalize_embeddings=True,
         show_progress_bar=True, convert_to_numpy=True,
     ).astype("float32")
@@ -330,51 +402,91 @@ def encode_query(text, stub=False, model_name=MODEL_NAME):
         return stub_vectors([q])[0]
     from sentence_transformers import SentenceTransformer
     import torch
-    enhet = "mps" if torch.backends.mps.is_available() else "cpu"
-    modell = SentenceTransformer(model_name, device=enhet)
-    return modell.encode([q], normalize_embeddings=True,
-                         convert_to_numpy=True).astype("float32")[0]
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    model = SentenceTransformer(model_name, device=device)
+    return model.encode([q], normalize_embeddings=True,
+                        convert_to_numpy=True).astype("float32")[0]
 
 
 # --------------------------------------------------------------------------
 # 4. build
 # --------------------------------------------------------------------------
 
+def embedding_key(p):
+    """Hash of exactly the text that gets embedded — same text, same vector."""
+    return hashlib.sha1(passage_text(p).encode("utf-8")).hexdigest()[:16]
+
+
+def previous_vectors(out_dir, model):
+    """{embedding key: vector} from the previous build. The index itself is
+    the cache: a passage whose embedded text hasn't changed needn't be
+    embedded again."""
+    import numpy as np
+    try:
+        info = json.load(open(os.path.join(out_dir, "info.json")))
+        meta = [json.loads(line) for line in
+                open(os.path.join(out_dir, "meta.jsonl"), encoding="utf-8")]
+        vectors = np.load(os.path.join(out_dir, "vectors.npy"))
+    except (OSError, ValueError):
+        return {}
+    if info.get("model") != model or len(meta) != len(vectors):
+        return {}       # a different model, or an interrupted build
+    # Indexes built before the cache have no "emb"; then the key is recomputed
+    # with today's passage_text(), which is only right if it hasn't changed since.
+    return {m.get("emb") or embedding_key(m): vectors[i] for i, m in enumerate(meta)}
+
+
 def build(stub=False, model_name=MODEL_NAME, out_dir=INDEX_DIR,
-          bara_bm25=False):
+          bm25_only=False):
     import numpy as np
 
-    poster = load_records()
-    print(f"{len(poster)} passager")
-    lager = Counter(p["layer"] for p in poster)
-    print("  " + "  ".join(f"{k} {v}" for k, v in sorted(lager.items())))
+    records = load_records()
+    print(f"{len(records)} passages")
+    layers = Counter(p["layer"] for p in records)
+    print("  " + "  ".join(f"{k} {v}" for k, v in sorted(layers.items())))
+    for p in records:
+        p["emb"] = embedding_key(p)
 
+    print("building BM25 …")
+    docs = [tokenize(f"{p['kontext']} {p['text']} {p.get('extra_bm25', '')}")
+            for p in records]
+    bm = BM25(docs)
+
+    vectors = None
+    if not bm25_only:
+        model = "stub" if stub else model_name
+        cache = previous_vectors(out_dir, model)
+        missing = {p["emb"]: passage_text(p) for p in records
+                   if p["emb"] not in cache}
+        print(f"embedding {len(missing)} passages "
+              f"({len(records) - sum(p['emb'] in missing for p in records)} "
+              f"reused from the previous build) …")
+        if missing:
+            new = encode(list(missing.values()), stub=stub, model_name=model_name)
+            cache.update(zip(missing, new))
+        vectors = np.stack([cache[p["emb"]] for p in records]).astype("float32")
+
+    # Everything is written only here, after embedding: an interrupted build
+    # leaves the old index untouched instead of half-overwritten.
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "meta.jsonl"), "w", encoding="utf-8") as fh:
-        for p in poster:
+        for p in records:
             fh.write(json.dumps(p, ensure_ascii=False) + "\n")
+    bm.save(os.path.join(out_dir, "bm25.pkl"))
 
-    print("bygger BM25 …")
-    docs = [tokenize(f"{p['kontext']} {p['text']}") for p in poster]
-    BM25(docs).save(os.path.join(out_dir, "bm25.pkl"))
+    if bm25_only:
+        print("skipped embedding (--bm25-only); vectors.npy left untouched")
+        return records
 
-    if bara_bm25:
-        print("hoppar över embeddingen (--bara-bm25); vectors.npy rörs inte")
-        return poster
-
-    print("embeddar …")
-    vek = encode([passage_text(p) for p in poster], stub=stub,
-                 model_name=model_name)
-    np.save(os.path.join(out_dir, "vectors.npy"), vek)
-
+    np.save(os.path.join(out_dir, "vectors.npy"), vectors)
     with open(os.path.join(out_dir, "info.json"), "w", encoding="utf-8") as fh:
-        json.dump({"model": "stub" if stub else model_name,
-                   "dim": int(vek.shape[1]), "n": len(poster),
+        json.dump({"model": model,
+                   "dim": int(vectors.shape[1]), "n": len(records),
                    "max_chars": MAX_CHARS, "overlap": OVERLAP}, fh,
                   ensure_ascii=False, indent=2)
 
-    print(f"\nskrev {out_dir}/  ({vek.shape[0]} × {vek.shape[1]})")
-    return poster
+    print(f"\nwrote {out_dir}/  ({vectors.shape[0]} × {vectors.shape[1]})")
+    return records
 
 
 # --------------------------------------------------------------------------
@@ -382,98 +494,117 @@ def build(stub=False, model_name=MODEL_NAME, out_dir=INDEX_DIR,
 # --------------------------------------------------------------------------
 
 class Index:
-    """Håller index i minnet. Använd 'shell' för flera frågor i rad —
-    annars laddas embeddingmodellen om vid varje CLI-anrop."""
+    """Holds the index in memory. Use 'shell' for several questions in a row —
+    otherwise the embedding model is reloaded on every CLI call."""
 
     def __init__(self, out_dir=INDEX_DIR):
         import numpy as np
         if not os.path.exists(os.path.join(out_dir, "info.json")):
-            sys.exit(f"hittar inget index i {out_dir} — kör 'build' först")
+            sys.exit(f"no index found in {out_dir} — run 'build' first")
         self.info = json.load(open(os.path.join(out_dir, "info.json")))
-        self.meta = [json.loads(l) for l in
+        self.meta = [json.loads(line) for line in
                      open(os.path.join(out_dir, "meta.jsonl"), encoding="utf-8")]
-        self.vek = np.load(os.path.join(out_dir, "vectors.npy"))
+        self.vectors = np.load(os.path.join(out_dir, "vectors.npy"))
+        if len(self.meta) != len(self.vectors):
+            sys.exit(f"meta.jsonl ({len(self.meta)} rows) and vectors.npy "
+                     f"({len(self.vectors)}) don't match — is a 'build' running, or "
+                     f"was --bm25-only run after the chunks changed? Finish a 'build'.")
         self.bm = BM25.load(os.path.join(out_dir, "bm25.pkl"))
         self.stub = self.info["model"] == "stub"
 
-    def _encode_query(self, fråga):
-        """Modellen laddas en gång per Index-instans, inte per fråga."""
+    def _encode_query(self, question):
+        """The model is loaded once per Index instance, not per question."""
         if self.stub:
-            return stub_vectors([f"query: {fråga}"])[0]
-        if not hasattr(self, "_modell"):
+            return stub_vectors([f"query: {question}"])[0]
+        if not hasattr(self, "_model"):
             from sentence_transformers import SentenceTransformer
             import torch
-            enhet = "mps" if torch.backends.mps.is_available() else "cpu"
-            self._modell = SentenceTransformer(self.info["model"], device=enhet)
-        return self._modell.encode([f"query: {fråga}"], normalize_embeddings=True,
-                                   convert_to_numpy=True).astype("float32")[0]
+            device = "mps" if torch.backends.mps.is_available() else "cpu"
+            self._model = SentenceTransformer(self.info["model"], device=device)
+        return self._model.encode([f"query: {question}"], normalize_embeddings=True,
+                                  convert_to_numpy=True).astype("float32")[0]
 
-    def search(self, fråga, k=8, parti=None, layer=None, per_parti=None,
-               kandidater=300, metod="hybrid", vikt_bm25=None):
-        """metod: 'hybrid' (BM25 + vektor), 'bm25' eller 'vektor'.
+    def search(self, question, k=8, party=None, layer=None, per_party=None,
+               candidates=300, method="hybrid", bm25_weight=None):
+        """method: 'hybrid' (BM25 + vector), 'bm25' or 'vector'.
 
-        De två rena lägena finns för ablationen i rapporten — och 'bm25'
-        kräver ingen modell, vilket gör det möjligt att testa allt annat
-        utan att ladda 2 GB.
+        The two pure modes exist for the ablation in the report — and 'bm25'
+        needs no model, which makes it possible to test everything else
+        without loading 2 GB.
+
+        Returns [(rrf_score, passage)], best first. When vector search ran,
+        each passage also carries "similarity" (cosine similarity to the
+        question).
         """
         import numpy as np
 
-        w_bm = RRF_VIKT_BM25 if vikt_bm25 is None else vikt_bm25
-        listor = []
-        if metod in ("hybrid", "bm25"):
-            listor.append((1.0 if metod == "bm25" else w_bm,
-                           self.bm.search(fråga, limit=kandidater,
-                                          ta_bort_partinamn=bool(parti))))
-        if metod in ("hybrid", "vektor"):
-            qv = self._encode_query(fråga)
-            sim = self.vek @ qv
-            listor.append((RRF_VIKT_VEKTOR,
-                           [(int(i), float(sim[i]))
-                            for i in np.argsort(-sim)[:kandidater]]))
+        w_bm = RRF_WEIGHT_BM25 if bm25_weight is None else bm25_weight
+        sim = None   # vector similarities; set below if the model runs
 
-        # Reciprocal Rank Fusion: rangordning slås ihop utan att vi behöver
-        # normalisera två helt olika poängskalor mot varandra.
+        # When searching for a specific party, widen the candidate pool to the
+        # whole index — otherwise the party's documents can fall outside the
+        # top 300 when other parties dominate the topic (e.g. MP+V+S on climate).
+        n_candidates = len(self.meta) if party else candidates
+
+        rankings = []
+        if method in ("hybrid", "bm25"):
+            rankings.append((1.0 if method == "bm25" else w_bm,
+                             self.bm.search(question, limit=n_candidates,
+                                            drop_party_names=bool(party))))
+        if method in ("hybrid", "vector"):
+            qv = self._encode_query(question)
+            sim = self.vectors @ qv
+            rankings.append((RRF_WEIGHT_VECTOR,
+                             [(int(i), float(sim[i]))
+                              for i in np.argsort(-sim)[:n_candidates]]))
+
+        # Reciprocal Rank Fusion: rankings are merged without having to
+        # normalise two completely different score scales against each other.
         rrf = defaultdict(float)
-        for vikt, lista in listor:
-            for rang, (i, _) in enumerate(lista):
-                rrf[i] += vikt / (RRF_K + rang + 1)
+        for weight, ranking in rankings:
+            for rank, (i, _) in enumerate(ranking):
+                rrf[i] += weight / (RRF_K + rank + 1)
 
-        träffar = []
-        for i, poäng in sorted(rrf.items(), key=lambda kv: -kv[1]):
+        hits = []
+        for i, score in sorted(rrf.items(), key=lambda kv: -kv[1]):
             m = self.meta[i]
             if layer and m["layer"] != layer:
                 continue
-            if parti:
-                egna = set(p for p in m.get("parti", "").split(";") if p)
-                if not egna & set(parti):
+            if party:
+                own = set(p for p in m.get("parti", "").split(";") if p)
+                if not own & set(party):
                     continue
-            träffar.append((poäng, m))
+            hits.append((score, m, i))
 
-        if per_parti:
-            per = defaultdict(int)
-            kvoterat = []
-            for poäng, m in träffar:
-                nycklar = [p for p in m.get("parti", "").split(";") if p] or ["—"]
-                if all(per[n] >= per_parti for n in nycklar):
+        if per_party:
+            count = defaultdict(int)
+            capped = []
+            for score, m, i in hits:
+                keys = [p for p in m.get("parti", "").split(";") if p] or ["—"]
+                if all(count[p] >= per_party for p in keys):
                     continue
-                for n in nycklar:
-                    per[n] += 1
-                kvoterat.append((poäng, m))
-            träffar = kvoterat
+                for p in keys:
+                    count[p] += 1
+                capped.append((score, m, i))
+            hits = capped
 
-        return träffar[:k]
+        # The cosine similarity comes along as "similarity" (only when vector
+        # search ran): the RRF score is rank-based and says nothing about how
+        # CLOSE a hit is to the question, so a relevance cutoff must use it.
+        return [(score, m if sim is None else {**m, "similarity": float(sim[i])})
+                for score, m, i in hits[:k]]
 
 
-def visa(träffar):
-    if not träffar:
-        print("inga träffar")
+def show_hits(hits):
+    if not hits:
+        print("no hits")
         return
-    for n, (poäng, m) in enumerate(träffar, 1):
-        källa = m.get("url") or f"{m.get('beteckning', '')} {m.get('rm', '')}"
+    for n, (score, m) in enumerate(hits, 1):
+        source = m.get("url") or f"{m.get('beteckning', '')} {m.get('rm', '')}"
         text = m["text"].replace("\n", " ")
-        print(f"\n{n:2}. [{poäng:.4f}] {m['layer'].upper()}  {m['kontext']}")
+        print(f"\n{n:2}. [{score:.4f}] {m['layer'].upper()}  {m['kontext']}")
         print(f"    {text[:260]}{'…' if len(text) > 260 else ''}")
-        print(f"    {källa}   id={m['id']}")
+        print(f"    {source}   id={m['id']}")
 
 
 # --------------------------------------------------------------------------
@@ -487,50 +618,50 @@ def main():
 
     b = sub.add_parser("build")
     b.add_argument("--stub", action="store_true",
-                   help="rökttest med fejk-encoder, ingen modell laddas")
+                   help="smoke test with a fake encoder, no model is loaded")
     b.add_argument("--model", default=MODEL_NAME)
     b.add_argument("--out", default=INDEX_DIR)
-    b.add_argument("--bara-bm25", action="store_true",
-                   help="bygg om meta + BM25 utan att röra vectors.npy")
+    b.add_argument("--bm25-only", action="store_true",
+                   help="rebuild meta + BM25 without touching vectors.npy")
 
     s = sub.add_parser("search")
-    s.add_argument("fraga")
+    s.add_argument("question")
     s.add_argument("-k", type=int, default=8)
-    s.add_argument("--parti", default="", help="t.ex. V,SD")
-    s.add_argument("--layer", choices=["said", "did"])
-    s.add_argument("--per-parti", type=int, default=None,
-                   help="max antal träffar per parti")
+    s.add_argument("--party", default="", help="e.g. V,SD")
+    s.add_argument("--layer", choices=["said", "did", "motion"])
+    s.add_argument("--per-party", type=int, default=None,
+                   help="max number of hits per party")
     s.add_argument("--index", default=INDEX_DIR)
-    s.add_argument("--metod", choices=["hybrid", "bm25", "vektor"], default="hybrid")
-    s.add_argument("--vikt-bm25", type=float, default=None,
-                   help=f"BM25:s vikt i RRF (standard {RRF_VIKT_BM25})")
+    s.add_argument("--method", choices=["hybrid", "bm25", "vector"], default="hybrid")
+    s.add_argument("--bm25-weight", type=float, default=None,
+                   help=f"BM25's weight in RRF (default {RRF_WEIGHT_BM25})")
 
-    sh = sub.add_parser("shell", help="flera frågor i rad, modellen laddas en gång")
+    sh = sub.add_parser("shell", help="several questions in a row, the model loads once")
     sh.add_argument("-k", type=int, default=8)
     sh.add_argument("--index", default=INDEX_DIR)
 
     a = ap.parse_args()
     if a.cmd == "build":
         build(stub=a.stub, model_name=a.model, out_dir=a.out,
-              bara_bm25=a.bara_bm25)
+              bm25_only=a.bm25_only)
     elif a.cmd == "shell":
         idx = Index(a.index)
-        print(f"{idx.info['n']} passager, modell {idx.info['model']}. "
-              f"Tom rad avslutar.")
+        print(f"{idx.info['n']} passages, model {idx.info['model']}. "
+              f"An empty line quits.")
         while True:
             try:
-                fråga = input("\n> ").strip()
+                question = input("\n> ").strip()
             except (EOFError, KeyboardInterrupt):
                 break
-            if not fråga:
+            if not question:
                 break
-            visa(idx.search(fråga, k=a.k))
+            show_hits(idx.search(question, k=a.k))
     else:
         idx = Index(a.index)
-        partier = [p.strip().upper() for p in a.parti.split(",") if p.strip()]
-        visa(idx.search(a.fraga, k=a.k, parti=partier or None,
-                        layer=a.layer, per_parti=a.per_parti, metod=a.metod,
-                        vikt_bm25=a.vikt_bm25))
+        parties = [p.strip().upper() for p in a.party.split(",") if p.strip()]
+        show_hits(idx.search(a.question, k=a.k, party=parties or None,
+                             layer=a.layer, per_party=a.per_party, method=a.method,
+                             bm25_weight=a.bm25_weight))
 
 
 if __name__ == "__main__":
