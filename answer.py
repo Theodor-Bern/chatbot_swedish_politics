@@ -105,7 +105,7 @@ def parties_in_question(question):
 # betänkanden), and a question that mentions votes still deserves the party's
 # motions and website for context. Gemini reads the question and decides what
 # to emphasise; --layer on the CLI restricts retrieval by hand.
-ALL_LAYERS = ["motion", "did", "said"]
+ALL_LAYERS = ["program", "motion", "did", "said"]
 
 
 # --------------------------------------------------------------------------
@@ -220,6 +220,8 @@ def build_context(hits, votes, argument_chars, limit=MAX_CONTEXT_CHARS, start=1)
     for i, (_score, m) in enumerate(hits, start):
         if m.get("layer") == "motion":
             source = f"motion {m.get('beteckning', '')} {m.get('rm', '')}"
+        elif m.get("layer") == "program":
+            source = f"{m.get('doc_type', 'partiprogram')}, s. {m.get('page')}"
         else:
             source = m.get("url") or f"{m.get('beteckning', '')} {m.get('rm', '')}"
         piece = f"\n[{i}] {m['layer'].upper()} — {m['kontext']}\nkälla: {source}\n{m['text']}"
@@ -243,10 +245,19 @@ def source_list(hits):
     numbers = {}
     for i, (_score, m) in enumerate(hits, 1):
         if m.get("layer") == "motion":
-            source = f"motion {m.get('beteckning', '')} {m.get('rm', '')}"
+            source = (f"motion {m.get('rm', '')}:{m.get('beteckning', '')} "
+                      f"({m.get('parti') or '?'}) – {m.get('doc_title', '')}").rstrip(" –")
+        elif m.get("layer") == "program":
+            year = f" {m['year']}" if m.get("year") else ""
+            source = (f"{m.get('doc_type', 'partiprogram')} ({m.get('parti')}){year}, "
+                      f"p. {m.get('page')} – {m.get('heading', '')}").rstrip(" –")
+        elif m.get("url"):
+            # Parties edit their pages without notice: show how current it is.
+            edited = f" (last edited {m['lastmod'][:10]})" if m.get("lastmod") else ""
+            source = m["url"] + edited
         else:
             punkt = f" punkt {m['punkt']}" if m.get("punkt") else ""
-            source = m.get("url") or f"{m.get('beteckning', '')} {m.get('rm', '')}{punkt}"
+            source = f"{m.get('beteckning', '')} {m.get('rm', '')}{punkt}"
         numbers.setdefault(source, []).append(str(i))
     return [f"[{', '.join(n)}] {s}" for s, n in numbers.items()]
 
@@ -258,6 +269,8 @@ def source_list(hits):
 SYSTEM = """Du är en granskare av svensk partipolitik. Du arbetar med tre
 sorters material och blandar dem aldrig ihop:
 
+  PROGRAM = partiets IDEOLOGI och grundvärderingar. Partiets antagna parti-
+            eller principprogram.
   MOTION = vad ett parti FÖRESLAGIT. Formella yrkanden i motioner till riksdagen.
   SAID   = vad ett parti SÄGER. Hämtat från partiets egen webbplats.
   DID    = vad som FAKTISKT HÄNT i riksdagen. Betänkanden och omröstningar.
@@ -266,7 +279,10 @@ REGLER, i fallande ordning:
 
 1. Du använder ENDAST det material du får i KONTEXT. Du har egna minnen av
    svensk politik — de är föråldrade och du använder dem inte. Om kontexten
-   inte räcker säger du det rent ut.
+   inte räcker säger du det rent ut. Du sätter inga egna etiketter på ett
+   parti ("marknadsliberal", "socialistisk", "nationalistisk"): använd bara
+   beteckningar som partiet själv använder i källan, och beskriv annars
+   ståndpunkterna i stället för att klassificera dem.
 
 2. Varje sakpåstående följs av sin källa i hakparentes: [3], eller
    [AU10 2022/23 punkt 1]. Ett påstående utan källa får inte skrivas.
@@ -276,10 +292,13 @@ REGLER, i fallande ordning:
    sig. Om du blir ombedd förklarar du kort att du redovisar vad partierna
    säger och gör, och erbjuder en jämförelse i en sakfråga användaren väljer.
 
-4. Saknas material för ett parti skriver du det som ett eget konstaterande:
-   "I materialet finns ingen motion från SD om detta." Du fyller aldrig
-   luckan med gissningar och du använder aldrig en källa om ett annat ämne
-   som om den handlade om det efterfrågade.
+4. Använd bara källor som faktiskt besvarar frågan. En hämtad passage som
+   handlar om något annat utelämnar du, även om den är det enda du har för
+   ett parti — använd aldrig en källa om ett annat ämne som om den handlade
+   om det efterfrågade. Saknas material fyller du aldrig luckan med
+   gissningar. Luckorna samlar du i EN kort mening i slutet av svaret
+   ("I materialet saknas motioner från C och KD och omröstningar om frågan
+   för samtliga partier."), inte en gång per parti.
 
 5. En MOTION är ett förslag partiet lämnat in — inte ett beslut och inte en
    lag. Skriv alltid "X har föreslagit" eller "X vill", ALDRIG "X har
@@ -302,8 +321,12 @@ REGLER, i fallande ordning:
    båda och låter läsaren dra slutsatsen.
 
 FORM: svar på svenska, i löpande text. Två till fem stycken. Jämför du flera
-partier tar du ett stycke per parti i samma ordning varje gång. Avsluta
-aldrig med en sammanfattande värdering av vilket parti som har rätt."""
+partier tar du ett stycke per parti i samma ordning varje gång. Inom varje
+parti håller du isär källtyperna och säger i meningen vilken det är: först
+vad partiet skriver i sitt partiprogram (PROGRAM), sedan vad det säger på sin
+webbplats (SAID), sedan vad det föreslagit i motioner (MOTION), sedan hur det
+agerat i riksdagen (DID). Slå aldrig ihop källor av olika typ i samma påstående. Avsluta aldrig med en sammanfattande
+värdering av vilket parti som har rätt."""
 
 
 # Step 2: what it knows. Q&A pairs that teach the model the Riksdag's
@@ -352,6 +375,14 @@ KNOWLEDGE = [
      "Att partiet varken stödde utskottets förslag eller reservationen som "
      "prövades. Det är ofta ett taktiskt val när partiet har en egen "
      "reservation som inte var uppe i just den omröstningen."),
+    ("Vad är ett partiprogram, och spelar det roll hur gammalt det är?",
+     "Partiprogrammet (även idé- eller principprogram) är partiets antagna "
+     "beskrivning av sin ideologi och sina grundvärderingar, beslutad av "
+     "partiets kongress eller stämma. Det är partiets gällande program oavsett "
+     "vilket år det antogs — partier byter program sällan, så årtalet säger "
+     "inget om huruvida det fortfarande gäller. Programmet är den bästa källan "
+     "för frågor om ideologi. Det är samtidigt mer allmänt hållet än dagens "
+     "politik: för konkreta, aktuella förslag säger motioner och webbplatser mer."),
     ("Vad är en motion?",
      "Ett formellt förslag som en eller flera riksdagsledamöter lämnar in "
      "i riksdagen, i sitt partis namn. Den innehåller ett eller flera "
@@ -521,8 +552,8 @@ def list_models():
 # 40,000 characters, and "vilka motioner har M gjort…" got only 4 motions. The
 # relevance cutoff still drops weak hits, so a bigger quota adds room, not noise.
 LAYER_QUOTA = {
-    "one_party": {"motion": 8, "did": 4, "said": 3},
-    "several_parties": {"motion": 2, "did": 1, "said": 1},   # per party
+    "one_party": {"program": 3, "motion": 8, "did": 4, "said": 3},
+    "several_parties": {"program": 1, "motion": 2, "did": 1, "said": 1},   # per party
 }
 # Relevance cutoff on cosine similarity. e5's values are tightly packed (often
 # 0.80–0.90), so the cutoff is relative to the question's best hit, plus an
@@ -532,14 +563,19 @@ LAYER_QUOTA = {
 # relevant, DID hits below 0.83 were not (e.g. water management on a nuclear question).
 # ponytail: hand-calibrated, replace with a reranker (PLAN step 5) if the floors don't hold.
 MAX_DISTANCE = 0.04
-MIN_SIMILARITY = {"motion": 0.80, "said": 0.80, "did": 0.83}
+MIN_SIMILARITY = {"program": 0.80, "motion": 0.80, "said": 0.80, "did": 0.83}
 
 
-def retrieve(idx, question, parties, layers=ALL_LAYERS, method="hybrid"):
+def retrieve(idx, question, parties, layers=ALL_LAYERS, method="hybrid",
+             share_quota=False):
     """Retrieval with fixed slots: (hits, gaps), where gaps are the
-    (party, layer) pairs that got no hit above the relevance cutoff."""
+    (party, layer) pairs that got no hit above the relevance cutoff.
+
+    share_quota: this layer is one of several searched for the same question
+    (tool calls in parallel), so it gets only its own share of the slots, not
+    all of them."""
     quota = LAYER_QUOTA["one_party" if len(parties) == 1 else "several_parties"]
-    if len(layers) == 1:        # a single layer gets all the slots
+    if len(layers) == 1 and not share_quota:    # a single layer gets all the slots
         layers = {layers[0]: sum(quota.values())}
     else:
         layers = {l: quota[l] for l in layers}
@@ -602,7 +638,7 @@ def answer(idx, question, method="hybrid", model=MODEL, dry_run=False, layer=Non
 
 # How a missing layer is named in the prompt (Swedish: Gemini reads it).
 LAYER_NAMES_SV = {"said": "hemsidan", "did": "riksdagsbeslut/voteringar",
-                  "motion": "motioner"}
+                  "motion": "motioner", "program": "partiprogrammet"}
 
 
 # --------------------------------------------------------------------------
@@ -622,9 +658,11 @@ och sökresultaten är din KONTEXT.
 
 - Gör ALLA sökningar du behöver i ett och samma steg, som parallella anrop.
   Du får högst ett steg till för kompletterande sökningar, sedan svarar du.
-- lager: motion = partiernas motioner, did = betänkanden och omröstningar,
+- lager: program = partiernas partiprogram (ideologi, grundvärderingar),
+  motion = partiernas motioner, did = betänkanden och omröstningar,
   said = partiernas webbplatser.
-- Sök som standard i alla tre lagren. Utelämna ett lager BARA om användaren
+- Sök som standard i alla fyra lagren. För frågor om ideologi och
+  grundvärderingar är program den viktigaste källan. Utelämna ett lager BARA om användaren
   uttryckligen ber om det ("bara motioner", "använd inga betänkanden"). Att
   frågan nämner omröstningar eller betänkanden är inget skäl att utelämna
   motioner eller webbplatser.
@@ -658,8 +696,9 @@ def search_tool():
                                 "asylpolitik?'. Inte ett enstaka sökord."),
                 "lager": types.Schema(
                     type="STRING", enum=ALL_LAYERS,
-                    description="motion = motioner, did = betänkanden och "
-                                "omröstningar, said = partiernas webbplatser."),
+                    description="program = partiprogram (ideologi), motion = "
+                                "motioner, did = betänkanden och omröstningar, "
+                                "said = partiernas webbplatser."),
                 "partier": types.Schema(
                     type="ARRAY",
                     items=types.Schema(type="STRING", enum=list(PARTY_NAMES)),
@@ -668,7 +707,7 @@ def search_tool():
             required=["fraga", "lager"]))])
 
 
-def run_search(idx, args, shown, method="hybrid"):
+def run_search(idx, args, shown, method="hybrid", share_quota=False):
     """Executes one 'sok' call: the same retrieval as the one-call path, for a
     single layer. Returns the text Gemini reads, plus stats. `shown` holds the
     passages returned so far this question; new ones are numbered after them
@@ -677,7 +716,8 @@ def run_search(idx, args, shown, method="hybrid"):
     if layer not in ALL_LAYERS:
         return f"Okänt lager: {layer}. Välj motion, did eller said.", 0, 0
     parties = [p for p in (args.get("partier") or []) if p in PARTY_NAMES]
-    hits, gaps = retrieve(idx, args.get("fraga") or "", parties, [layer], method)
+    hits, gaps = retrieve(idx, args.get("fraga") or "", parties, [layer], method,
+                          share_quota=share_quota)
 
     already = {m["id"] for _, m in shown}
     new = [(score, m) for score, m in hits if m["id"] not in already]
@@ -726,12 +766,18 @@ def answer_with_tools(idx, question, method="hybrid", model=MODEL):
         # The model's turn goes back unchanged: Gemini 3 needs its "thought
         # signatures" in the history to continue after a function call.
         contents.append(response.candidates[0].content)
+        # Several layers searched in the same step share the quota the way the
+        # one-call path does (e.g. 2 motions + 1 vote + 1 website per party);
+        # only a lone search ("bara motioner") gets all the slots. Without
+        # this, three parallel searches fetched three times the material.
+        layers_this_step = {dict(fc.args or {}).get("lager") for fc in function_calls}
         results = []
         for fc in function_calls:
             args = dict(fc.args or {})
             searches.append(f"{args.get('lager')}:{','.join(args.get('partier') or []) or 'alla'}"
                             f" \"{args.get('fraga', '')}\"")
-            text, n_gaps, n_votes = run_search(idx, args, shown, method)
+            text, n_gaps, n_votes = run_search(idx, args, shown, method,
+                                               share_quota=len(layers_this_step) > 1)
             gaps += n_gaps
             vote_points += n_votes
             context_chars += len(text)
@@ -765,7 +811,7 @@ def print_answer(response, hits, info, contents, dry_run):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("question", help="the question, or 'chat', or 'models'")
-    ap.add_argument("--layer", choices=["said", "did", "motion"], default=None)
+    ap.add_argument("--layer", choices=ALL_LAYERS, default=None)
     ap.add_argument("--method", choices=["hybrid", "bm25", "vector"],
                     default="hybrid")
     ap.add_argument("--model", default=MODEL)
