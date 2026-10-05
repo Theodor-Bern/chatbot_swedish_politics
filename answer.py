@@ -427,15 +427,33 @@ def knowledge_turns():
     return turns
 
 
+# Chat memory: the last exchanges are sent again with each question (the API
+# keeps no state). Only question + answer text, not the retrieved passages:
+# those would multiply the tokens per call on the free tier.
+HISTORY_TURNS = 4
+# Passage numbers restart at [1] for every question, so an old "[3]" would
+# point at a new question's passage 3. Old answers lose their citations.
+CITATION = re.compile(r"\s*\[\d+(?:\s*[,–-]\s*\d+)*\]")
+
+
+def history_turns(history):
+    """Earlier (question, answer) pairs as user/model turns, citations removed."""
+    turns = []
+    for q, a in history[-HISTORY_TURNS:]:
+        turns.append({"role": "user", "parts": [{"text": f"FRÅGA: {q}"}]})
+        turns.append({"role": "model", "parts": [{"text": CITATION.sub("", a)}]})
+    return turns
+
+
 VOTING_ADVICE_NOTE = ("\n\nOBS: användaren ber om en partirekommendation. "
                       "Följ regel 3 — rekommendera inte, förklara kort "
                       "varför, och erbjud en sakfrågejämförelse.\n")
 
 
-def build_contents(question, context, voting_advice):
+def build_contents(question, context, voting_advice, history=()):
     """Gemini format: alternating user/model turns, the context last."""
     instruction = VOTING_ADVICE_NOTE if voting_advice else ""
-    return knowledge_turns() + [{"role": "user", "parts": [{"text":
+    return knowledge_turns() + history_turns(history) + [{"role": "user", "parts": [{"text":
         f"KONTEXT\n{context}\n\nSLUT PÅ KONTEXT{instruction}\n\n"
         f"FRÅGA: {question}"}]}]
 
@@ -696,7 +714,8 @@ def retrieve(idx, question, parties, layers=ALL_LAYERS, method="hybrid",
     return hits, gaps
 
 
-def answer(idx, question, method="hybrid", model=MODEL, dry_run=False, layer=None):
+def answer(idx, question, method="hybrid", model=MODEL, dry_run=False, layer=None,
+           history=()):
     parties = parties_in_question(question)
     layers = [layer] if layer else ALL_LAYERS
     voting_advice = bool(VOTING_ADVICE_WORDS.search(question))
@@ -707,7 +726,7 @@ def answer(idx, question, method="hybrid", model=MODEL, dry_run=False, layer=Non
     if gaps:
         context += "\n\nINGET RELEVANT MATERIAL HITTADES FÖR\n" + "\n".join(
             f"- {PARTY_NAMES[p]} ({p}): {LAYER_NAMES_SV[l]}" for p, l in gaps)
-    contents = build_contents(question, context, voting_advice)
+    contents = build_contents(question, context, voting_advice, history)
 
     info = {"parties": parties or "all", "layers": ",".join(layers),
             "hits": len(hits), "gaps": len(gaps),
@@ -822,7 +841,7 @@ def run_search(idx, args, shown, method="hybrid", searched=None):
     return text, len(gaps), len(votes)
 
 
-def answer_with_tools(idx, question, method="hybrid", model=MODEL):
+def answer_with_tools(idx, question, method="hybrid", model=MODEL, history=()):
     """Gemini searches with the 'sok' tool, then answers. A manual loop, not
     the SDK's automatic function calling: we control the number of API calls
     and keep the passage numbers consistent across searches."""
@@ -831,7 +850,7 @@ def answer_with_tools(idx, question, method="hybrid", model=MODEL):
     client = gemini_client()
     voting_advice = bool(VOTING_ADVICE_WORDS.search(question))
     note = VOTING_ADVICE_NOTE if voting_advice else ""
-    contents = knowledge_turns() + [
+    contents = knowledge_turns() + history_turns(history) + [
         {"role": "user", "parts": [{"text": f"FRÅGA: {question}{note}"}]}]
 
     shown, searches, calls = [], [], 0
@@ -930,15 +949,17 @@ def main():
     # an API call), and --layer is a manual restriction for the one-call path.
     one_call = a.no_tools or a.dry_run or a.layer
 
-    def ask(q):
+    def ask(q, history=()):
         if one_call:
             return answer(idx, q, method=a.method, model=a.model,
-                          dry_run=a.dry_run, layer=a.layer)
-        return answer_with_tools(idx, q, method=a.method, model=a.model)
+                          dry_run=a.dry_run, layer=a.layer, history=history)
+        return answer_with_tools(idx, q, method=a.method, model=a.model,
+                                 history=history)
 
     idx = rag_index.Index(a.index)
     if a.question == "chat":
-        print(f"{idx.info['n']} passages. An empty line quits.")
+        print(f"{idx.info['n']} passages. An empty line quits, 'ny' forgets the conversation.")
+        history = []
         while True:
             try:
                 q = input("\n> ").strip()
@@ -946,7 +967,14 @@ def main():
                 break
             if not q:
                 break
-            print_answer(*ask(q), dry_run=a.dry_run)
+            if q.lower() == "ny":
+                history.clear()
+                print("(conversation forgotten)")
+                continue
+            result = ask(q, history)
+            print_answer(*result, dry_run=a.dry_run)
+            if result[0]:
+                history.append((q, result[0]))
         return
 
     print_answer(*ask(a.question), dry_run=a.dry_run)
