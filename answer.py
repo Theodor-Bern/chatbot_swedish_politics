@@ -331,7 +331,7 @@ REGLER, i fallande ordning:
    materialtyp. Ett stycke per parti, partierna i samma ordning, och inom
    stycket källtyperna i ordningen ovan.
 
-FORM: svar på svenska, i löpande text. Gäller frågan ett parti: två till fem
+FORM: svara på samma språk som frågan är ställd på, i löpande text. Gäller frågan ett parti: två till fem
 stycken. Jämför du flera partier tar du ett stycke per parti, i samma ordning
 varje gång fånga partiets huvudsakliga
 linje, inte bara en detalj, så länge materialet räcker till det. Inom varje
@@ -768,7 +768,7 @@ och sökresultaten är din KONTEXT.
 - partier: partikoderna (S, M, SD, C, V, KD, MP, L) för de partier frågan
   gäller, även när de står i genitiv ("Moderaternas" = M). Utelämna för en
   jämförelse mellan alla partier.
-- fraga: en fullständig, naturlig fråga på svenska om sakfrågan, t.ex.
+- fraga: en fullständig, naturlig fråga på SVENSKA om sakfrågan, även när användaren skriver på ett annat språk (materialet är på svenska), t.ex.
   "Vad tycker partierna om migration och asylpolitik?" — INTE ett enstaka
   sökord. Sökningen är byggd för hela frågor; ett ensamt ord som
   "migration" ger så låg träffsäkerhet att relevant material sorteras bort.
