@@ -418,13 +418,16 @@ KNOWLEDGE = [
 ]
 
 
-def knowledge_turns():
-    """KNOWLEDGE as alternating user/model turns (Gemini's chat format)."""
-    turns = []
-    for q, a in KNOWLEDGE:
-        turns.append({"role": "user", "parts": [{"text": q}]})
-        turns.append({"role": "model", "parts": [{"text": a}]})
-    return turns
+# KNOWLEDGE goes in the system prompt, not as fake chat turns: it is standing
+# background, and it then stays apart from the real conversation history.
+SYSTEM += """
+
+VAD DU VET OM RIKSDAGEN
+
+Bakgrund om hur riksdagen och materialet fungerar. Använd den för att tolka
+KONTEXT rätt. Den är ingen källa om partiernas politik.
+
+""" + "\n\n".join(f"F: {q}\nS: {a}" for q, a in KNOWLEDGE)
 
 
 # Chat memory: the last exchanges are sent again with each question (the API
@@ -451,9 +454,9 @@ VOTING_ADVICE_NOTE = ("\n\nOBS: användaren ber om en partirekommendation. "
 
 
 def build_contents(question, context, voting_advice):
-    """Gemini format: alternating user/model turns, the context last."""
+    """Gemini format: one user turn, the context before the question."""
     instruction = VOTING_ADVICE_NOTE if voting_advice else ""
-    return knowledge_turns() + [{"role": "user", "parts": [{"text":
+    return [{"role": "user", "parts": [{"text":
         f"KONTEXT\n{context}\n\nSLUT PÅ KONTEXT{instruction}\n\n"
         f"FRÅGA: {question}"}]}]
 
@@ -849,7 +852,7 @@ def answer_with_tools(idx, question, method="hybrid", model=MODEL):
     client = gemini_client()
     voting_advice = bool(VOTING_ADVICE_WORDS.search(question))
     note = VOTING_ADVICE_NOTE if voting_advice else ""
-    contents = knowledge_turns() + [
+    contents = [
         {"role": "user", "parts": [{"text": f"FRÅGA: {question}{note}"}]}]
 
     shown, searches, calls = [], [], 0

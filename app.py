@@ -64,7 +64,7 @@ def main():
     st.caption('Svar baseras på sparade källor och kan vara ofullständiga. '
                'Varje fråga behandlas separat – skriv ut parti och ämne även i följdfrågor.')
 
-    index_path = Path(os.environ.get('POLITICS_INDEX_DIR', ROOT / 'out/index_motions'))
+    index_path = Path(os.environ.get('POLITICS_INDEX_DIR', ROOT / 'out/index'))
     model = bot.MODEL
 
     ready = True
