@@ -896,6 +896,11 @@ def answer_with_tools(idx, question, method="hybrid", model=MODEL):
             if unsearched and i == len(function_calls) - 1:
                 text += ("\n\nEJ SÖKTA LAGER: " + ", ".join(LAYER_NAMES_SV[l] for l in unsearched)
                          + ". Påstå inte att material saknas där — det har inte sökts.")
+            if i == len(function_calls) - 1:
+                # Gemini answers right after these Swedish results and drifts
+                # into Swedish; the FORM rule alone didn't hold.
+                text += (f"\n\nSVARSSPRÅK: skriv svaret på samma språk som frågan "
+                         f"\"{question}\" är skriven på, inte på materialets språk.")
             gaps += n_gaps
             vote_points += n_votes
             context_chars += len(text)
