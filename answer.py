@@ -44,7 +44,7 @@ try:
 except ImportError:
     party_positions = None
 
-MODEL = "gemini-3.6-flash"
+MODEL = "gemini-3.5-flash-lite"
 MAX_CONTEXT_CHARS = 40000
 # A motion's argument can be several thousand characters. With 8 parties in the
 # prompt, the start is enough to show what the yrkande is about, and more would
@@ -106,7 +106,8 @@ def parties_in_question(question):
 # betänkanden), and a question that mentions votes still deserves the party's
 # motions and website for context. Gemini reads the question and decides what
 # to emphasise; --layer on the CLI restricts retrieval by hand.
-ALL_LAYERS = ["program", "motion", "did", "said"]
+# ponytail: "did" (votes) switched off for now; add it back here to re-enable.
+ALL_LAYERS = ["program", "motion", "said"]
 
 
 # --------------------------------------------------------------------------
@@ -300,7 +301,9 @@ REGLER, i fallande ordning:
    om det efterfrågade. Saknas material fyller du aldrig luckan med
    gissningar. Luckorna samlar du i EN kort mening i slutet av svaret
    ("I materialet saknas motioner från C och KD och omröstningar om frågan
-   för samtliga partier."), inte en gång per parti.
+   för samtliga partier."), inte en gång per parti. Ett parti som står med
+   under "Så agerade partierna" i omröstningsblocket HAR material om den
+   omröstningen — skriv aldrig att omröstningar saknas för det partiet.
 
 
 5. En MOTION är ett förslag partiet lämnat in — inte ett beslut och inte en
@@ -319,36 +322,18 @@ REGLER, i fallande ordning:
    andra partiers reservationer. Visar senare material en annan
    hållning redovisar du båda i tidsordning, utan att kalla det åsiktsbyte.
 
- 7. Låt frågans typ avgöra vilket material som bär svaret.
-   - IDEOLOGIFRÅGOR ("vad står X för", "hur ser X på staten/marknaden/
-     familjen", "vad är skillnaden mellan X och Y i grunden"): utgå från
-     PROGRAM. Återge partiets egna formuleringar och begrepp. MOTION och
-     DID får användas som exempel på hur värderingen tar sig uttryck, men
-     svaret ska vila på programmet.
-   - SAKFRÅGOR (en viss reform, lag, skatt eller myndighet): utgå från
-     MOTION, DID och SAID. PROGRAM får nämnas i högst en mening som
-     bakgrund, och bara om passagen faktiskt tar upp sakfrågan.
-   - Härled ALDRIG en konkret ståndpunkt ur ett program. Att ett program
-     betonar "individens frihet" säger inget om vad partiet vill i en
-     enskild fråga. Står det inte uttryckligen, skriver du det inte.
-   - Markera nivån i texten: "I sitt partiprogram beskriver X ..." för
-     PROGRAM, "X har föreslagit ..." för MOTION. Läsaren ska alltid se om
-     det är en princip, ett förslag, ett uttalande eller ett beslut.
-   - Pekar programmet och partiets motioner eller röster åt olika håll
-     redovisar du båda, med källa, utan att kalla det en motsägelse.
-   - Ange programmets antagandeår när det framgår av källan:
-     "I principprogrammet från 2021 ..." [5].
+ 7. Använd primärt PROGRAM, SAID och MOTION. Använd endast DID om användaren frågar efter voteringar eller reservationer,
      
-     
-8. Ordna svaret efter materialtyp i denna ordning, och hoppa över
-   rubriker du saknar material för: Grundsyn (PROGRAM), Vad partiet säger
-   (SAID), Vad partiet föreslagit (MOTION), Vad som hänt i riksdagen (DID).
-   Vid jämförelse mellan flera partier: ett stycke per parti, samma ordning
-   för alla.
+8. Gäller frågan ETT parti: ordna svaret efter materialtyp under rubrikerna
+   Grundsyn (PROGRAM), Vad partiet säger (SAID), Vad partiet föreslagit
+   (MOTION), Vad som hänt i riksdagen (DID), och hoppa över rubriker du
+   saknar material för. Jämför du FLERA partier: INGA rubriker per
+   materialtyp. Ett stycke per parti, partierna i samma ordning, och inom
+   stycket källtyperna i ordningen ovan.
 
 FORM: svar på svenska, i löpande text. Gäller frågan ett parti: två till fem
 stycken. Jämför du flera partier tar du ett stycke per parti, i samma ordning
-varje gång och fånga partiets huvudsakliga
+varje gång fånga partiets huvudsakliga
 linje, inte bara en detalj, så länge materialet räcker till det. Inom varje
 parti håller du isär källtyperna och säger i meningen vilken det är, i den
 här ordningen: partiprogram (PROGRAM), webbplats (SAID), motioner (MOTION),
@@ -674,7 +659,7 @@ def retrieve(idx, question, parties, layers=ALL_LAYERS, method="hybrid",
     layers get more slots each than four do, and a lone layer gets all."""
     quota = LAYER_QUOTA["one_party" if len(parties) == 1 else "several_parties"]
     searched = [l for l in (searched or layers) if l in quota]
-    budget = sum(quota.values())
+    budget = sum(quota[l] for l in ALL_LAYERS)
     weight = sum(quota[l] for l in searched)
     layers = {l: math.ceil(quota[l] * budget / weight) for l in layers}
 
@@ -757,19 +742,11 @@ och sökresultaten är din KONTEXT.
 
 - Gör ALLA sökningar du behöver i ett och samma steg, som parallella anrop.
   Du får högst ett steg till för kompletterande sökningar, sedan svarar du.
-- lager: program = partiernas partiprogram (ideologi, grundvärderingar),
-  motion = partiernas motioner, did = betänkanden och omröstningar,
-  said = partiernas webbplatser.
-- Välj lager efter vad frågan gäller:
-  · ideologi, grundvärderingar, syn på samhället ("vilken ideologi…",
-    "vad står partiet för…"): program och said. Motioner och omröstningar
-    gäller enskilda sakfrågor och säger sällan något om ideologin.
-  · en sakfråga ("vad vill partierna med migration?"): alla fyra lagren.
-  · vad partierna föreslagit eller hur de röstat: motion respektive did,
-    och gärna program och said som bakgrund.
-  Ber användaren uttryckligen om vissa källor ("bara motioner", "använd
-  inga betänkanden") följer du det. Att frågan nämner omröstningar eller
-  betänkanden är inget skäl att utelämna motioner eller webbplatser.
+- lager: UTELÄMNA lager, så söks alla lager på en gång (program =
+  partiprogram, motion = motioner, said = webbplatser). Ange lager bara när användaren uttryckligen
+  begränsar källorna ("bara motioner", "inga webbplatser"). Att frågan
+  gäller ideologi är inget skäl att begränsa: det avgör du när du skriver
+  svaret, inte när du söker. Omröstningar finns inte i materialet just nu.
 - partier: partikoderna (S, M, SD, C, V, KD, MP, L) för de partier frågan
   gäller, även när de står i genitiv ("Moderaternas" = M). Utelämna för en
   jämförelse mellan alla partier.
@@ -784,8 +761,8 @@ def search_tool():
     from google.genai import types
     return types.Tool(function_declarations=[types.FunctionDeclaration(
         name="sok",
-        description="Söker i materialet om svensk partipolitik. Ett anrop söker "
-                    "ETT lager. Returnerar numrerade passager att hänvisa till.",
+        description="Söker i materialet om svensk partipolitik, i alla lager "
+                    "om lager utelämnas. Returnerar numrerade passager att hänvisa till.",
         parameters=types.Schema(
             type="OBJECT",
             properties={
@@ -800,27 +777,33 @@ def search_tool():
                                 "asylpolitik?'. Inte ett enstaka sökord."),
                 "lager": types.Schema(
                     type="STRING", enum=ALL_LAYERS,
-                    description="program = partiprogram (ideologi), motion = "
-                                "motioner, did = betänkanden och omröstningar, "
-                                "said = partiernas webbplatser."),
+                    description="Utelämna för att söka alla lager. Ange bara när "
+                                "användaren uttryckligen begränsar källorna. "
+                                "program = partiprogram, motion = motioner, "
+                                "said = webbplatser."),
                 "partier": types.Schema(
                     type="ARRAY",
                     items=types.Schema(type="STRING", enum=list(PARTY_NAMES)),
                     description="Partikoder att söka för. Utelämna för alla partier."),
             },
-            required=["fraga", "lager"]))])
+            required=["fraga"]))])
+
+
+def call_layers(args):
+    """The layers one 'sok' call searches: all of them unless 'lager' is given."""
+    return [args["lager"]] if args.get("lager") else ALL_LAYERS
 
 
 def run_search(idx, args, shown, method="hybrid", searched=None):
     """Executes one 'sok' call: the same retrieval as the one-call path, for a
-    single layer. Returns the text Gemini reads, plus stats. `shown` holds the
+    layer, or all layers if none is given. Returns the text Gemini reads, plus stats. `shown` holds the
     passages returned so far this question; new ones are numbered after them
     and appended, so the numbers stay unique across searches."""
-    layer = args.get("lager")
-    if layer not in ALL_LAYERS:
-        return f"Okänt lager: {layer}. Välj motion, did eller said.", 0, 0
+    layers = call_layers(args)
+    if not set(layers) <= set(ALL_LAYERS):
+        return f"Okänt lager: {args['lager']}. Välj {', '.join(ALL_LAYERS)} eller utelämna.", 0, 0
     parties = [p for p in (args.get("partier") or []) if p in PARTY_NAMES]
-    hits, gaps = retrieve(idx, args.get("fraga") or "", parties, [layer], method,
+    hits, gaps = retrieve(idx, args.get("fraga") or "", parties, layers, method,
                           searched=searched)
 
     already = {m["id"] for _, m in shown}
@@ -828,7 +811,7 @@ def run_search(idx, args, shown, method="hybrid", searched=None):
     start = len(shown) + 1
     shown.extend(new)
 
-    votes = vote_facts(new, parties) if layer == "did" else []
+    votes = vote_facts(new, parties) if "did" in layers else []
     size = "one_party" if len(parties) == 1 else "several_parties"
     text = build_context(new, votes, MAX_ARGUMENT_CHARS[size], limit=None, start=start)
     if gaps:
@@ -878,14 +861,20 @@ def answer_with_tools(idx, question, method="hybrid", model=MODEL):
         # one-call path does (e.g. 2 motions + 1 vote + 1 website per party);
         # only a lone search ("bara motioner") gets all the slots. Without
         # this, three parallel searches fetched three times the material.
-        layers_this_step = {dict(fc.args or {}).get("lager") for fc in function_calls}
+        layers_this_step = {l for fc in function_calls for l in call_layers(dict(fc.args or {}))}
+        # Layers nobody searched aren't gaps: without saying so, Gemini wrote
+        # "I materialet saknas motioner…" after a program-only search.
+        unsearched = [l for l in ALL_LAYERS if l not in layers_this_step]
         results = []
-        for fc in function_calls:
+        for i, fc in enumerate(function_calls):
             args = dict(fc.args or {})
-            searches.append(f"{args.get('lager')}:{','.join(args.get('partier') or []) or 'alla'}"
+            searches.append(f"{args.get('lager') or 'alla lager'}:{','.join(args.get('partier') or []) or 'alla'}"
                             f" \"{args.get('fraga', '')}\"")
             text, n_gaps, n_votes = run_search(idx, args, shown, method,
-                                               searched=sorted(layers_this_step - {None}))
+                                               searched=sorted(layers_this_step))
+            if unsearched and i == len(function_calls) - 1:
+                text += ("\n\nEJ SÖKTA LAGER: " + ", ".join(LAYER_NAMES_SV[l] for l in unsearched)
+                         + ". Påstå inte att material saknas där — det har inte sökts.")
             gaps += n_gaps
             vote_points += n_votes
             context_chars += len(text)
