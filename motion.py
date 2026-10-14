@@ -17,6 +17,7 @@ the most uncommon words with the yrkande.
 Run:
     python motion.py inspect <one motion>.html
     python motion.py build data/html/mot-2022-2025.html out/motion_chunks.jsonl
+    python motion.py subtyp out/motion_subtyp.json    # Riksdagen's motion type, from the API
 
 The output is read by rag_index.py (the MOTION layer) — search and answering
 happen there and in answer.py, not here. The output's JSON field names
@@ -356,6 +357,31 @@ def inspect(path):
         print(f"   -> {match}\n")
 
 
+RIKSMOTEN = ["2022/23", "2023/24", "2024/25", "2025/26"]
+API = "https://data.riksdagen.se/dokumentlista/?doktyp=mot&rm={rm}&utformat=json&sz=200"
+
+
+def fetch_subtyp(out_path):
+    """{"2024/25:1504": "Enskild motion", ...} from Riksdagen's open data.
+    The HTML doesn't say whether a motion is the party group's (Kommittémotion,
+    Partimotion) or one or a few members' own (Enskild motion); signer count
+    can't tell two backbenchers from a committee group."""
+    import urllib.parse
+    import urllib.request
+    subtyp = {}
+    for rm in RIKSMOTEN:
+        url = API.format(rm=urllib.parse.quote(rm, safe=""))
+        while url:
+            with urllib.request.urlopen(url, timeout=60) as r:
+                page = json.load(r)["dokumentlista"]
+            for d in page.get("dokument") or []:
+                subtyp[f"{d['rm']}:{d['beteckning']}"] = d.get("subtyp") or ""
+            url = page.get("@nasta_sida")
+        print(f"  {rm}: {len(subtyp)} motions so far")
+    Path(out_path).write_text(json.dumps(subtyp, ensure_ascii=False, indent=0), encoding="utf-8")
+    print(Counter(subtyp.values()))
+
+
 def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__)
@@ -364,6 +390,8 @@ def main():
         inspect(Path(sys.argv[2]))
     elif cmd == "build" and len(sys.argv) == 4:
         build(sys.argv[2], sys.argv[3])
+    elif cmd == "subtyp":
+        fetch_subtyp(sys.argv[2])
     else:
         sys.exit(__doc__)
 

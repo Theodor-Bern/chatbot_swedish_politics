@@ -107,7 +107,10 @@ def parties_in_question(question):
 # motions and website for context. Gemini reads the question and decides what
 # to emphasise; --layer on the CLI restricts retrieval by hand.
 # ponytail: "did" (votes) switched off for now; add it back here to re-enable.
-ALL_LAYERS = ["program", "motion", "said"]
+ALL_LAYERS = ["program", "motion", "proposition", "said"]
+# Propositions are the government's: only these parties are searched for them,
+# so the opposition doesn't get a "no propositions" gap on every question.
+GOVERNMENT = {"M", "KD", "L"}
 
 
 # --------------------------------------------------------------------------
@@ -208,6 +211,17 @@ def vote_facts(hits, parties):
 # context
 # --------------------------------------------------------------------------
 
+def enskild(m):
+    """An enskild motion: one or a few members' proposal, not the party's
+    line. Riksdagen's own subtyp; one signer as fallback for the ~6% of
+    motions the API listing didn't return."""
+    if m.get("layer") != "motion":
+        return False
+    if m.get("subtyp"):
+        return m["subtyp"] == "Enskild motion"
+    return len([s for s in m.get("undertecknare", "").split(";") if s]) == 1
+
+
 def build_context(hits, votes, argument_chars, limit=MAX_CONTEXT_CHARS, start=1):
     """The retrieved material as text. Passages are numbered from `start`;
     limit=None keeps every passage (tool results: a numbered passage must
@@ -222,6 +236,10 @@ def build_context(hits, votes, argument_chars, limit=MAX_CONTEXT_CHARS, start=1)
     for i, (_score, m) in enumerate(hits, start):
         if m.get("layer") == "motion":
             source = f"motion {m.get('beteckning', '')} {m.get('rm', '')}"
+            if enskild(m):
+                source += f" (enskild motion, {m['undertecknare'].replace(';', ', ')})"
+        elif m.get("layer") == "proposition":
+            source = f"prop. {m.get('rm', '')}:{m.get('beteckning', '')}, {m.get('datum', '')}"
         elif m.get("layer") == "program":
             source = f"{m.get('doc_type', 'partiprogram')}, s. {m.get('page')}"
         else:
@@ -249,9 +267,12 @@ def source_list(hits):
         if m.get("layer") == "motion":
             source = (f"motion {m.get('rm', '')}:{m.get('beteckning', '')} "
                       f"({m.get('parti') or '?'}) – {m.get('doc_title', '')}").rstrip(" –")
+        elif m.get("layer") == "proposition":
+            source = (f"prop. {m.get('rm', '')}:{m.get('beteckning', '')} "
+                      f"(regeringen: M, KD, L) – {m.get('doc_title', '')}").rstrip(" –")
         elif m.get("layer") == "program":
             year = f" {m['year']}" if m.get("year") else ""
-            source = (f"{m.get('doc_type', 'partiprogram')} ({m.get('parti')}){year}, "
+            source = (f"{m.get('doc_type', 'partiprogram')} ({m.get('parti', '').replace(';', ', ')}){year}, "
                       f"p. {m.get('page')} – {m.get('heading', '')}").rstrip(" –")
         elif m.get("url"):
             # Parties edit their pages without notice: show how current it is.
@@ -270,13 +291,14 @@ def source_list(hits):
 
 SYSTEM = """Du är en expert på svensk politik. Din uppgift är att leverera pricksäker information om de 8 olika riksdagspartierna i Sverige.
 
-Det finns fyra olika sorters material. 
+Det finns fyra olika sorters material.
 
   PROGRAM = partiets IDEOLOGI och grundvärderingar. Partiets antagna parti-
             eller principprogram.
   MOTION = vad ett parti FÖRESLAGIT. Formella yrkanden i motioner till riksdagen.
+  PROPOSITION = vad REGERINGEN (M, KD, L) FÖRESLAGIT. Regeringens
+            propositioner till riksdagen, inklusive budgetens reformer.
   SAID   = vad ett parti SÄGER. Hämtat från partiets egen webbplats.
-  DID    = vad som FAKTISKT HÄNT i riksdagen. Betänkanden och omröstningar.
 
 REGLER, i fallande ordning:
 
@@ -287,8 +309,8 @@ REGLER, i fallande ordning:
    beteckningar som partiet själv använder i källan, och beskriv annars
    ståndpunkterna i stället för att klassificera dem.
 
-2. Varje sakpåstående följs av sin källa i hakparentes: [3], eller
-   [AU10 2022/23 punkt 1]. Ett påstående utan källa får inte skrivas.
+2. Varje sakpåstående följs av sin källa i hakparentes: [3]. Ett påstående
+   utan källa får inte skrivas.
 
 3. Du rekommenderar ALDRIG ett parti och rangordnar dem aldrig. Du säger
    inte vilket parti som "passar" någon, oavsett hur användaren beskriver
@@ -300,34 +322,27 @@ REGLER, i fallande ordning:
    ett parti — använd aldrig en källa om ett annat ämne som om den handlade
    om det efterfrågade. Saknas material fyller du aldrig luckan med
    gissningar. Luckorna samlar du i EN kort mening i slutet av svaret
-   ("I materialet saknas motioner från C och KD och omröstningar om frågan
-   för samtliga partier."), inte en gång per parti. Ett parti som står med
-   under "Så agerade partierna" i omröstningsblocket HAR material om den
-   omröstningen — skriv aldrig att omröstningar saknas för det partiet.
-
+   ("I materialet saknas motioner från C och KD."), inte en gång per parti.
 
 5. En MOTION är ett förslag partiet lämnat in — inte ett beslut och inte en
    lag. Skriv alltid "X har föreslagit" eller "X vill", ALDRIG "X har
-   genomfört" för ett motionsyrkande.
+   genomfört" för ett motionsyrkande. En "enskild motion" är en enskild
+   ledamots förslag, inte partiets linje: skriv "en M-ledamot har föreslagit",
+   inte "M vill", och låt motioner från partigruppen väga tyngre.
+   En PROPOSITION är regeringens gemensamma förslag: skriv "regeringen
+   (M, KD, L) har föreslagit", aldrig att ett av partierna ensamt föreslagit
+   det, och dra ingen slutsats om SD:s eller oppositionens hållning ur den.
+   TIDÖAVTALET (i PROGRAM) är ingen ideologi utan en överenskommelse från
+   2022 mellan M, KD, L och SD: skriv "Tidöpartierna (M, KD, L, SD) kom 2022
+   överens om", aldrig att ett av partierna ensamt vill det.
 
-6. En omröstning redovisar du alltid med datum och vad som prövades, hämtat
-   ur omröstningsblocket: "L röstade i april 2023 mot S:s reservation, som
-   bl.a. ville att regeringen skulle ta fram ett lagförslag om kunskapskrav
-   för permanent uppehållstillstånd [SfU15 2022/23 punkt 1]". ALDRIG bara
-   "L röstade mot reservation 1 (S)", och ALDRIG "L är emot kunskapskrav"
-   utifrån en sådan röst — en nej-röst mot en reservation är inte ett nej
-   till sakfrågan (se vad du vet om omröstningar). Framgår det inte vad som
-   prövades, utelämnar du omröstningen. Ett partis egen reservation ÄR dess
-   ställning på punkten: redovisa vad den ville, inte hur partiet röstade om
-   andra partiers reservationer. Visar senare material en annan
-   hållning redovisar du båda i tidsordning, utan att kalla det åsiktsbyte.
+6. Visar senare material en annan hållning redovisar du båda i tidsordning,
+   utan att kalla det åsiktsbyte.
 
- 7. Använd primärt PROGRAM, SAID och MOTION. Använd endast DID om användaren frågar efter voteringar eller reservationer,
-     
-8. Gäller frågan ETT parti: ordna svaret efter materialtyp under rubrikerna
+7. Gäller frågan ETT parti: ordna svaret efter materialtyp under rubrikerna
    Grundsyn (PROGRAM), Vad partiet säger (SAID), Vad partiet föreslagit
-   (MOTION), Vad som hänt i riksdagen (DID), och hoppa över rubriker du
-   saknar material för. Jämför du FLERA partier: INGA rubriker per
+   (MOTION), Vad regeringen föreslagit (PROPOSITION), och hoppa över
+   rubriker du saknar material för. Jämför du FLERA partier: INGA rubriker per
    materialtyp. Ett stycke per parti, partierna i samma ordning, och inom
    stycket källtyperna i ordningen ovan.
 
@@ -337,59 +352,21 @@ varje gång fånga partiets huvudsakliga
 linje, inte bara en detalj, så länge materialet räcker till det. Inom varje
 parti håller du isär källtyperna och säger i meningen vilken det är, i den
 här ordningen: partiprogram (PROGRAM), webbplats (SAID), motioner (MOTION),
-agerande i riksdagen (DID). Ta BARA med de källtyper som faktiskt besvarar
-frågan — ordningen är ingen checklista, och en motion eller omröstning om en
+regeringens propositioner (PROPOSITION).
+Ta BARA med de källtyper som faktiskt besvarar
+frågan — ordningen är ingen checklista, och en motion om en
 annan sakfråga hör inte hemma i ett svar om ideologi. Slå aldrig ihop källor
 av olika typ i samma påstående. Avsluta aldrig med en sammanfattande
 värdering av vilket parti som har rätt."""
 
 
-# Step 2: what it knows. Q&A pairs that teach the model the Riksdag's
-# semantics — without them it reads "avstod" and "acklamation" as data errors.
+# Step 2: what it knows. Q&A pairs that teach the model what the material
+# means, so it doesn't read a missing page or motivering as a data error.
 KNOWLEDGE = [
-    ("Vad är en reservation i ett betänkande?",
-     "En reservation är ett avvikande förslag från en minoritet i utskottet. "
-     "Den talar om vad de partier som står bakom den ville i stället för "
-     "utskottets förslag. Reservationer är därför den tydligaste källan till "
-     "ett partis position i ett enskilt ärende."),
-    ("Vad betyder det att en punkt avgjordes med acklamation?",
-     "Att ingen omröstning begärdes. Riksdagen sa ja utan votering. Det är "
-     "helt normalt — omkring två tredjedelar av alla punkter avgörs så — och "
-     "det betyder att det inte finns några röstsiffror att redovisa. Det är "
-     "inte en lucka i materialet."),
-    ("Vad ställs mot vad i en votering?",
-     "Alltid utskottets förslag mot EN reservation. Ja betyder stöd för "
-     "utskottets förslag, nej betyder stöd för reservationen. Ett rått "
-     "\"nej\" säger därför ingenting förrän man vet vilken reservation som "
-     "prövades."),
-    ("Varför har Moderaterna, Kristdemokraterna och Liberalerna så få "
-     "reservationer i materialet?",
-     "De är regeringspartier under perioden. Regeringspartier reserverar sig "
-     "i praktiken aldrig mot sitt eget utskotts förslag. Deras position syns "
-     "i utskottets förslag i stället, inte i reservationer. Att ett "
-     "regeringsparti saknar reservationer är alltså väntat och säger "
-     "ingenting om partiets aktivitet."),
-    ("Betyder en röst mot en reservation att partiet är emot det "
-     "reservationen föreslår?",
-     "Nej, inte i sig. En reservation begär ofta ett tillkännagivande: att "
-     "regeringen ska göra något. Majoriteten röstar ofta nej för att arbetet "
-     "redan pågår (en utredning, en kommande proposition), för att frågan "
-     "hanteras i ett annat ärende, eller för att reservationen buntar ihop "
-     "flera krav. Regeringspartier röstar i praktiken alltid nej till "
-     "oppositionens reservationer. En nej-röst visar bara att partiet inte "
-     "ville fatta just det beslutet vid den tidpunkten. Att partiet är emot "
-     "själva sakfrågan kan bara skrivas om annat material säger det."),
-    ("Vad är ett särskilt yttrande?",
-     "En kommentar som en ledamot fogar till betänkandet utan att yrka på "
-     "något annat beslut. Särskilda yttranden röstas aldrig om."),
     ("Vad betyder det att ett parti saknar sida om ett ämne på sin webbplats?",
      "Bara att ämnet inte finns i partiets eget A–Ö-register. Det betyder "
      "inte att partiet saknar åsikt i frågan. Skillnaden ska alltid skrivas "
      "ut: materialet saknas, slutsatsen om partiets uppfattning uteblir."),
-    ("Vad betyder det att ett parti avstod i en omröstning?",
-     "Att partiet varken stödde utskottets förslag eller reservationen som "
-     "prövades. Det är ofta ett taktiskt val när partiet har en egen "
-     "reservation som inte var uppe i just den omröstningen."),
     ("Vad är ett partiprogram, och spelar det roll hur gammalt det är?",
      "Partiprogrammet (även idé- eller principprogram) är partiets antagna "
      "beskrivning av sin ideologi och sina grundvärderingar, beslutad av "
@@ -403,7 +380,24 @@ KNOWLEDGE = [
      "i riksdagen, i sitt partis namn. Den innehåller ett eller flera "
      "yrkanden — konkreta beslutsförslag — och en motivering till varför. "
      "En motion är partiets egen, ofiltrerade begäran, inte ett resultat "
-     "av förhandling med andra partier (till skillnad från ett betänkande)."),
+     "av förhandling med andra partier."),
+    ("Vad är en proposition?",
+     "Ett lagförslag eller annat förslag som regeringen lämnar till "
+     "riksdagen. Under perioden består regeringen av M, KD och L, med SD som "
+     "samarbetsparti utanför regeringen. En proposition är regeringens "
+     "gemensamma förslag, ofta en kompromiss, och visar inte vad ett enskilt "
+     "regeringsparti hade velat på egen hand. Budgetpropositionen samlar "
+     "årets reformer. Regeringspartier lägger sällan egna motioner i frågor "
+     "där regeringen redan lämnat förslag — att M, KD och L har få motioner "
+     "är därför väntat."),
+    ("Vilken roll har Sverigedemokraterna under perioden?",
+     "SD sitter inte i regeringen men är samarbetsparti till M, KD och L "
+     "genom Tidöavtalet (oktober 2022), som anger gemensamma reformer inom "
+     "bl.a. migration, kriminalpolitik, energi, vård och skola, och ett "
+     "budgetsamarbete. SD står inte bakom regeringens propositioner formellt: "
+     "SD:s egna förslag finns i SD:s motioner, och det gemensamma i "
+     "Tidöavtalet. Att en proposition genomför något ur Tidöavtalet framgår "
+     "bara om materialet säger det."),
     ("Vad är skillnaden mellan ett yrkande och en motivering i en motion?",
      "Yrkandet är den korta, formella beslutsmeningen ('Riksdagen ställer "
      "sig bakom ...'). Motiveringen är resonemanget bakom den — varför "
@@ -655,8 +649,8 @@ def list_models():
 # 40,000 characters, and "vilka motioner har M gjort…" got only 4 motions. The
 # relevance cutoff still drops weak hits, so a bigger quota adds room, not noise.
 LAYER_QUOTA = {
-    "one_party": {"program": 3, "motion": 8, "did": 4, "said": 3},
-    "several_parties": {"program": 1, "motion": 2, "did": 1, "said": 1},   # per party
+    "one_party": {"program": 3, "motion": 8, "proposition": 3, "did": 4, "said": 3},
+    "several_parties": {"program": 1, "motion": 2, "proposition": 1, "did": 1, "said": 1},   # per party
 }
 # Relevance cutoff on cosine similarity. e5's values are tightly packed (often
 # 0.80–0.90), so the cutoff is relative to the question's best hit, plus an
@@ -666,7 +660,13 @@ LAYER_QUOTA = {
 # relevant, DID hits below 0.83 were not (e.g. water management on a nuclear question).
 # ponytail: hand-calibrated, replace with a reranker (PLAN step 5) if the floors don't hold.
 MAX_DISTANCE = 0.04
-MIN_SIMILARITY = {"program": 0.80, "motion": 0.80, "said": 0.80, "did": 0.83}
+# Government parties file no group motions (2022–2026: M 0, KD 0, L 1
+# kommittémotion; their policy goes into propositions), so their motion slots
+# filled up with backbenchers' local requests. At most this many enskilda motions per party; the rest stay empty.
+# 0 = never: an enskild motion is one member's wish, not the party's line.
+MAX_ENSKILDA = 0
+# ponytail: proposition floor copied from motion, not calibrated yet.
+MIN_SIMILARITY = {"program": 0.80, "motion": 0.80, "proposition": 0.80, "said": 0.80, "did": 0.83}
 
 
 def retrieve(idx, question, parties, layers=ALL_LAYERS, method="hybrid",
@@ -687,8 +687,10 @@ def retrieve(idx, question, parties, layers=ALL_LAYERS, method="hybrid",
     slots = {}
     for party in parties or list(PARTY_NAMES):
         for one_layer, n in layers.items():
+            if one_layer == "proposition" and party not in GOVERNMENT:
+                continue
             slots[party, one_layer] = (n, idx.search(
-                question, k=n + 5, party=[party], layer=one_layer, method=method))
+                question, k=n + 20, party=[party], layer=one_layer, method=method))
 
     # The cutoff is computed per layer: website prose systematically gets
     # higher similarity than motion yrkanden, so a shared cutoff would cut
@@ -701,12 +703,16 @@ def retrieve(idx, question, parties, layers=ALL_LAYERS, method="hybrid",
     seen, hits, gaps = set(), [], []
     for (party, one_layer), (n, candidates) in slots.items():
         cutoff = max(MIN_SIMILARITY[one_layer], best[one_layer] - MAX_DISTANCE)
-        taken = 0
+        taken = singles = 0
         for score, m in candidates:
             if taken == n:
                 break
             if "similarity" in m and m["similarity"] < cutoff:
                 continue        # sorted by RRF, not similarity: keep looking
+            if enskild(m):
+                if singles == MAX_ENSKILDA:
+                    continue
+                singles += 1
             taken += 1          # a shared reservation counts for each party,
             if m["id"] not in seen:      # but is shown only once
                 seen.add(m["id"])
@@ -743,7 +749,8 @@ def answer(idx, question, method="hybrid", model=MODEL, dry_run=False, layer=Non
 
 # How a missing layer is named in the prompt (Swedish: Gemini reads it).
 LAYER_NAMES_SV = {"said": "hemsidan", "did": "riksdagsbeslut/voteringar",
-                  "motion": "motioner", "program": "partiprogrammet"}
+                  "motion": "motioner", "program": "partiprogrammet",
+                  "proposition": "propositioner"}
 
 
 # --------------------------------------------------------------------------
@@ -764,7 +771,8 @@ och sökresultaten är din KONTEXT.
 - Gör ALLA sökningar du behöver i ett och samma steg, som parallella anrop.
   Du får högst ett steg till för kompletterande sökningar, sedan svarar du.
 - lager: UTELÄMNA lager, så söks alla lager på en gång (program =
-  partiprogram, motion = motioner, said = webbplatser). Ange lager bara när användaren uttryckligen
+  partiprogram, motion = motioner, proposition = regeringens
+  propositioner, said = webbplatser). Ange lager bara när användaren uttryckligen
   begränsar källorna ("bara motioner", "inga webbplatser"). Att frågan
   gäller ideologi är inget skäl att begränsa: det avgör du när du skriver
   svaret, inte när du söker. Omröstningar finns inte i materialet just nu.
@@ -843,7 +851,7 @@ def run_search(idx, args, shown, method="hybrid", searched=None):
     return text, len(gaps), len(votes)
 
 
-def answer_with_tools(idx, question, method="hybrid", model=MODEL):
+def answer_with_tools(idx, question, method="hybrid", model=MODEL, history=()):
     """Gemini searches with the 'sok' tool, then answers. A manual loop, not
     the SDK's automatic function calling: we control the number of API calls
     and keep the passage numbers consistent across searches."""
@@ -852,7 +860,9 @@ def answer_with_tools(idx, question, method="hybrid", model=MODEL):
     client = gemini_client()
     voting_advice = bool(VOTING_ADVICE_WORDS.search(question))
     note = VOTING_ADVICE_NOTE if voting_advice else ""
-    contents = [
+    # Earlier exchanges let a follow-up ("och KD då?") be understood: Gemini
+    # writes the search question itself, so it can fill in party and topic.
+    contents = history_turns(history) + [
         {"role": "user", "parts": [{"text": f"FRÅGA: {question}{note}"}]}]
 
     shown, searches, calls = [], [], 0

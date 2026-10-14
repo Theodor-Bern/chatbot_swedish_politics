@@ -61,9 +61,10 @@ class AppTests(unittest.TestCase):
         app = self.app()
         app.chat_input[0].set_value('Vad vill S?').run()
         self.assertFalse(app.exception)
-        self.responder.assert_called_once_with(self.fake_index, 'Vad vill S?', model=answer.MODEL)
+        self.responder.assert_called_once_with(self.fake_index, 'Vad vill S?',
+                                               model=answer.MODEL, history=[])
         self.assertTrue(any('Ett förslag [1].' in m.value for m in app.markdown))
-        result = app.session_state['result']
+        result = app.session_state['chat'][-1]
         self.assertEqual(result['sources'], ['[1, 2] https://example.org/politik'])
         self.assertEqual(len(result['links']), 1)
         app.run()
@@ -71,6 +72,10 @@ class AppTests(unittest.TestCase):
         app.chat_input[0].set_value('Vad vill V?').run()
         self.assertEqual(self.responder.call_count, 2)
         self.assertEqual(self.loader.call_count, 1)
+        # The follow-up carries the first exchange, and both stay on screen.
+        self.assertEqual(self.responder.call_args.kwargs['history'],
+                         [('Vad vill S?', 'Ett förslag [1].')])
+        self.assertEqual(sum('Ett förslag [1].' in m.value for m in app.markdown), 2)
 
     def test_api_failure_is_safe_and_retry_is_possible(self):
         self.responder.side_effect = RuntimeError('401 UNAUTHENTICATED secret-test-value')
@@ -79,10 +84,10 @@ class AppTests(unittest.TestCase):
         self.assertFalse(app.exception)
         self.assertIn('godkände inte åtkomsten', app.error[0].value)
         self.assertNotIn('secret-test-value', app.error[0].value)
-        self.assertNotIn('result', app.session_state)
+        self.assertEqual(app.session_state['chat'], [])
         self.responder.side_effect = None
         app.chat_input[0].set_value('Försök igen').run()
-        self.assertIn('result', app.session_state)
+        self.assertEqual(len(app.session_state['chat']), 1)
 
     def test_backend_system_exit_is_handled(self):
         self.responder.side_effect = SystemExit('daily quota is used up')

@@ -39,6 +39,9 @@ PROGRAMS = {
     "kristdemokraterna_partiprogram.pdf": ("KD", "principprogram", 2025),
     "miljopartiet_partiprogram.pdf": ("MP", "partiprogram", 2025),
     "liberalerna_partiprogram.pdf": ("L", "partiprogram", 2025),
+    # Not a programme but the four Tidö parties' joint agreement (Oct 2022):
+    # the only document SD signed together with the government parties.
+    "tidoavtalet-overenskommelse-for-sverige-slutlig.pdf": ("M;KD;L;SD", "Tidöavtalet", 2022),
 }
 
 NUMBERED_HEADING = re.compile(r"^(KAPITEL\s+\d+\.?|\d{1,2}(\.\d+)*\.?)\s+[A-ZÅÄÖa-zåäö]")

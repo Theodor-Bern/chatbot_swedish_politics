@@ -14,7 +14,8 @@ import rag_index
 ROOT = Path(__file__).resolve().parent
 INDEX_FILES = ('info.json', 'meta.jsonl', 'vectors.npy', 'bm25.pkl')
 LAYER_NAMES = {'said': 'partisidor', 'did': 'riksdagsmaterial',
-               'motion': 'motioner', 'program': 'partiprogram'}
+               'motion': 'motioner', 'program': 'partiprogram',
+               'proposition': 'propositioner'}
 
 
 @st.cache_resource(show_spinner=False)
@@ -62,7 +63,7 @@ def main():
     st.title('Svensk politik')
     st.write('Utforska vad partierna säger, föreslår och gör i riksdagen.')
     st.caption('Svar baseras på sparade källor och kan vara ofullständiga. '
-               'Varje fråga behandlas separat – skriv ut parti och ämne även i följdfrågor.')
+               'Boten minns de senaste frågorna i samtalet, så du kan ställa följdfrågor.')
 
     index_path = Path(os.environ.get('POLITICS_INDEX_DIR', ROOT / rag_index.INDEX_DIR))
     model = bot.MODEL
@@ -89,16 +90,23 @@ def main():
                         'Hur röstade S om kärnkraft?'):
             st.write(example)
 
+    chat = st.session_state.setdefault('chat', [])
+    if chat and st.button('Nytt samtal'):
+        chat.clear()
+    for result in chat:
+        render_result(result)
+
     question = st.chat_input('Skriv din fråga om svensk politik', disabled=not ready)
     if question and question.strip():
-        st.session_state.pop('result', None)
         try:
             with st.spinner('Läser underlaget, söker och formulerar svar…'):
                 fingerprint = tuple((name, (index_path / name).stat().st_mtime_ns,
                                      (index_path / name).stat().st_size) for name in INDEX_FILES)
                 idx, lock = load_index(str(index_path), fingerprint)
                 with lock:
-                    response, hits, info, _ = bot.answer_with_tools(idx, question.strip(), model=model)
+                    response, hits, info, _ = bot.answer_with_tools(
+                        idx, question.strip(), model=model,
+                        history=[(r['question'], r['answer']) for r in chat])
                 links, seen = [], set()
                 for number, (_, meta) in enumerate(hits, 1):
                     url = meta.get('url', '')
@@ -106,16 +114,16 @@ def main():
                     if parsed.scheme in ('https', 'http') and parsed.netloc and url not in seen:
                         links.append((f'Öppna originalkälla [{number}]', url))
                         seen.add(url)
-                st.session_state.result = {
+                result = {
                     'question': question.strip(), 'answer': response,
                     'sources': bot.source_list(hits), 'links': links, 'info': info,
                     'layers': [LAYER_NAMES.get(layer, layer) for layer in
                                sorted({m['layer'] for m in idx.meta})],
                 }
+            chat.append(result)
+            render_result(result)
         except (Exception, SystemExit) as error:
             st.error(error_message(error))
-    if 'result' in st.session_state:
-        render_result(st.session_state.result)
 
 
 if __name__ == '__main__':

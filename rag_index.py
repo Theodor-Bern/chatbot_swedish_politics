@@ -5,6 +5,7 @@ SAID    = what the parties say on their websites  (out/positions_said_*.jsonl)
 DID     = what's in the Riksdag's committee reports (out/chunks.jsonl)
 MOTION  = the parties' formal proposals            (out/motion_chunks.jsonl)
 PROGRAM = the parties' adopted party programmes     (out/program_chunks.jsonl)
+PROPOSITION = the government's (M, KD, L) bills    (out/proposition_chunks.jsonl)
 
 Every passage gets a context line in front of its text. The context line is a
 wordalisation of the metadata — "Reservation 1 (C) — AU10 2022/23 punkt 1" —
@@ -41,7 +42,9 @@ from collections import Counter, defaultdict
 SAID_GLOB = "out/positions_said_*.jsonl"
 DID_CHUNKS = "out/chunks.jsonl"
 MOTION_CHUNKS = "out/motion_chunks.jsonl"
+MOTION_SUBTYP = "out/motion_subtyp.json"     # python motion.py subtyp
 PROGRAM_CHUNKS = "out/program_chunks.jsonl"
+PROPOSITION_CHUNKS = "out/proposition_chunks.jsonl"
 INDEX_DIR = "out/index"
 
 MODEL_NAME = "intfloat/multilingual-e5-large"
@@ -229,13 +232,24 @@ def motion_context(d):
 
 def program_context(d):
     party = d.get("parti", "")
-    name = PARTY_NAMES.get(party, party)
+    if ";" in party:        # Tidöavtalet: one document, four parties
+        name, party = "Tidöpartierna", party.replace(";", ", ")
+    else:
+        name = PARTY_NAMES.get(party, party)
     ctx = f"{name} ({party}), {d.get('doc_type', 'partiprogram')}"
     if d.get("year"):
         ctx += f" (antaget {d['year']})"
     if d.get("heading"):
         ctx += f" — {d['heading']}"
     return ctx
+
+
+def proposition_context(d):
+    ctx = (f"Regeringen (M, KD, L), proposition {d.get('rm', '')}:{d.get('beteckning', '')} "
+           f"{d.get('doc_title', '')}")
+    if d.get("heading"):
+        ctx += f" — {d['heading']}"
+    return ctx.strip()
 
 
 def load_records():
@@ -285,6 +299,8 @@ def load_records():
                 "text": piece,
             })
 
+    subtyp = (json.load(open(MOTION_SUBTYP, encoding="utf-8"))
+              if os.path.exists(MOTION_SUBTYP) else {})
     if os.path.exists(MOTION_CHUNKS):
         for line in open(MOTION_CHUNKS, encoding="utf-8"):
             d = json.loads(line)
@@ -302,6 +318,7 @@ def load_records():
                     "sektion_text": d.get("sektion_text", ""),
                     "yrkande_nr": d.get("yrkande_nr", 0),
                     "undertecknare": d.get("undertecknare", ""),
+                    "subtyp": subtyp.get(f"{d.get('rm')}:{d.get('beteckning')}", ""),
                     "kontext": ctx,
                     "text": piece,
                     "extra_bm25": d.get("sektion_text", ""),
@@ -321,6 +338,25 @@ def load_records():
                     "year": d.get("year"),
                     "heading": d.get("heading", ""),
                     "page": d.get("page"),
+                    "kontext": ctx,
+                    "text": piece,
+                })
+
+    if os.path.exists(PROPOSITION_CHUNKS):
+        for line in open(PROPOSITION_CHUNKS, encoding="utf-8"):
+            d = json.loads(line)
+            ctx = proposition_context(d)
+            for i, piece in enumerate(split_text(d.get("text", ""))):
+                records.append({
+                    "id": f"{d['chunk_id']}#{i}",
+                    "parent": d["chunk_id"],
+                    "layer": "proposition",
+                    "parti": d.get("parti", ""),
+                    "rm": d.get("rm", ""),
+                    "beteckning": d.get("beteckning", ""),
+                    "doc_title": d.get("doc_title", ""),
+                    "heading": d.get("heading", ""),
+                    "datum": d.get("datum", ""),
                     "kontext": ctx,
                     "text": piece,
                 })
@@ -659,7 +695,7 @@ def main():
     s.add_argument("question")
     s.add_argument("-k", type=int, default=8)
     s.add_argument("--party", default="", help="e.g. V,SD")
-    s.add_argument("--layer", choices=["said", "did", "motion", "program"])
+    s.add_argument("--layer", choices=["said", "did", "motion", "program", "proposition"])
     s.add_argument("--per-party", type=int, default=None,
                    help="max number of hits per party")
     s.add_argument("--index", default=INDEX_DIR)
