@@ -1,52 +1,133 @@
 # chatbot_swedish_politics
 
-A RAG-based chatbot for Swedish Poltics. Based on real data from Riksdagen, like betänkanden, motions and votes.
+En RAG-baserad chattbot om svensk politik. Den svarar på vad riksdagspartierna
+tycker, säger och föreslår, och bygger svaren på sparade källor: partiernas
+program och webbplatser, motioner, regeringens propositioner och Tidöavtalet.
+Varje påstående i svaret hänvisar till en källa.
 
-## Lokalt webbgränssnitt
+## Material (lager)
 
-Kör från projektets huvudmapp, i samma Pythonmiljö som terminalversionen:
+| Lager | Vad | Källa | Byggs med |
+|---|---|---|---|
+| `program` | Partiernas parti-/principprogram, samt Tidöavtalet (M, KD, L, SD) | PDF i `data/pdf/` | `program.py` |
+| `said` | Vad partierna säger på sina webbplatser | partiernas A–Ö-sidor | `scrapers/scraper.py` |
+| `motion` | Partiernas motioner 2022/23–2025/26, yrkande + motivering | data.riksdagen.se | `motion.py` |
+| `proposition` | Regeringens (M, KD, L) propositioner: sammanfattning, samt reformavsnitten i budget- och vårpropositionerna | data.riksdagen.se | `proposition.py` |
+| `did` | Betänkanden och voteringar | data.riksdagen.se | `parser_riksdagen/`, `party_positions.py` |
+
+`did` finns kvar i indexet men söks inte: punktvisa reservationer och voteringar
+gav smala, missvisande svar på breda frågor (se `ALL_LAYERS` i `answer.py`).
+
+Några medvetna val:
+
+- **Enskilda motioner används inte** (`MAX_ENSKILDA = 0` i `answer.py`). En
+  enskild motion är en eller några ledamöters förslag, inte partiets linje.
+  Motionstypen (kommittémotion, partimotion, enskild motion) hämtas från
+  Riksdagens API. Regeringspartierna lägger inga kommittémotioner, så för M, KD
+  och L kommer partiernas förslag i stället från propositionerna.
+- **Propositioner tillskrivs regeringen (M, KD, L)**, inte SD. SD:s gemensamma
+  politik med regeringen finns i Tidöavtalet, SD:s egen i SD:s motioner.
+- **Gemini väljer själv sina sökningar** (verktygsanrop). Varje parti och lager
+  söks för sig med fasta platser, så att ingen källtyp tränger undan de andra.
+
+## Kom igång
+
+Kör allt från projektets huvudmapp:
 
 ```sh
 python3 -m pip install -r requirements.txt
 ```
 
 Ange Gemini-nyckeln i terminalen (zsh på Mac). Kör första raden, klistra in
-själva nyckeln och tryck Enter. Inga tecken syns. Kör sedan export-raden:
+nyckeln och tryck Enter (inga tecken syns), kör sedan export-raden:
 
 ```sh
 read -s "GEMINI_API_KEY?Klistra in nyckeln och tryck Enter: "
 export GEMINI_API_KEY
 ```
 
-Starta webbgränssnittet i samma terminal:
+Nyckeln ska aldrig läggas i koden eller skickas till GitHub.
+
+### Webbgränssnitt
 
 ```sh
 python3 -m streamlit run app.py --server.address localhost --browser.gatherUsageStats false
 ```
 
-Öppna adressen som visas, normalt http://localhost:8501. Terminalen behöver
-vara igång; Ctrl+C stoppar appen. Vid en ny API-nyckel behöver appen startas om.
-Nyckeln ska inte läggas i koden eller skickas till GitHub.
+Öppna adressen som visas, normalt http://localhost:8501. Appen minns samtalet
+(de senaste 20 frågorna och svaren), så följdfrågor fungerar. "Nytt samtal" eller
+en omladdning av sidan börjar om. Källistan visar allt hämtat underlag, inte
+bara det som citeras. Starta om appen efter ändringar i koden.
 
-Appen använder `out/index_motions` som standard. Detta index innehåller även
-partisidor och riksdagsmaterial. Modellen väljs från standardvärdet i `answer.py`.
-Varje index behöver `info.json`, `meta.jsonl`, `vectors.npy` och `bm25.pkl` från
-samma bygge. Röstningsfunktionen använder dessutom `out/positions_did.jsonl`
-och betänkandetexterna i `out/chunks.jsonl`. Datafilerna ingår inte i Git.
-`POLITICS_INDEX_DIR` kan användas som miljövariabel för en annan indexmapp.
+Appen läser indexet i `out/index`. `POLITICS_INDEX_DIR` kan peka på en annan
+indexmapp.
 
-Varje fråga anropar samma verktygsstyrda sökning som terminalversionen och kan
-innebära flera Gemini-anrop. Indexet återanvänds mellan frågor. Den första
-frågan kan ta längre tid när sökmodellen laddas. Appen visar det senaste svaret;
-tidigare frågor skickas inte med som samtalsminne. Indexvalet avgör vilket
-material som faktiskt kan hittas, även om koden stöder fler källtyper.
-
-Källistan visar det hämtade underlaget, inte enbart citerade källor. Länkar till
-original visas där metadata innehåller en webbadress. Gränssnittet ändrar inte
-söklogik, prompt eller underliggande data och garanterar inte korrekta svar.
-
-Gränssnittstester utan Gemini-anrop:
+### Terminal
 
 ```sh
+python3 answer.py "Vad vill Sverigedemokraterna göra åt gängkriminaliteten?"
+python3 answer.py chat                                  # flera frågor i rad
+python3 answer.py "Vad tycker partierna om kärnkraft?" --dry-run   # visa prompten, inget API-anrop
+```
+
+## Bygga data och index
+
+Data och härledda filer ingår inte i Git (`data/` och `out/` är ignorerade).
+Ordningen nedan återskapar allt.
+
+1. **Ladda ner** Riksdagens öppna data (data.riksdagen.se) som HTML till
+   `data/html/`: betänkanden (`bet-2022-2025.html/`), motioner
+   (`mot-2022-2025.html/`) och propositioner (`prop-2022-2025.html/`).
+   Lägg partiprogrammen och Tidöavtalet som PDF i `data/pdf/` med filnamnen
+   i `PROGRAMS` i `program.py`.
+2. **Partiernas webbplatser** (SAID):
+   ```sh
+   python3 scrapers/scraper.py fetch all
+   python3 scrapers/scraper.py extract all       # -> out/positions_said_*.jsonl
+   ```
+3. **Betänkanden** (DID, behövs för indexbygget även om lagret inte söks):
+   ```sh
+   python3 parser_riksdagen/build_corpus.py data/html/bet-2022-2025.html out/chunks.jsonl
+   ```
+4. **Motioner** och deras motionstyp från Riksdagens API:
+   ```sh
+   python3 motion.py build data/html/mot-2022-2025.html out/motion_chunks.jsonl
+   python3 motion.py subtyp out/motion_subtyp.json
+   ```
+5. **Propositioner**:
+   ```sh
+   python3 proposition.py build data/html/prop-2022-2025.html out/proposition_chunks.jsonl
+   ```
+6. **Partiprogram och Tidöavtalet**:
+   ```sh
+   python3 program.py build                       # -> out/program_chunks.jsonl
+   ```
+7. **Index** (BM25 + vektorer med `intfloat/multilingual-e5-large`):
+   ```sh
+   python3 rag_index.py build
+   ```
+   Vektorerna cachas per passage, så ett nytt bygge bäddar bara in nya eller
+   ändrade passager. Ett bygge från noll tar många timmar på en laptop.
+   Ändras bara metadata (t.ex. motionstyp): `python3 rag_index.py build --bm25-only`.
+
+## Utvärdering och tester
+
+```sh
+python3 eval_retrieval.py                          # sökningens kvalitet, inga Gemini-anrop
+python3 eval_retrieval.py --detail P04             # visa träffarna för en fråga
 python3 -m unittest discover -s tests -p 'test_app.py'
 ```
+
+Facit i `eval/questions.json` är regler över metadata (lager, parti, ämne),
+inte handplockade passager. Frågetyperna `did`, `jamforelse` och
+`identifierare` testar DID-lagret, som inte längre söks av boten.
+
+## Kända begränsningar
+
+- e5-modellens likhetsvärden ligger tätt (ofta 0,84–0,87), så sökningen kan
+  hämta passager på närliggande men fel ämne (t.ex. Irans kärnenergiprogram
+  för en fråga om kärnkraft). Promptens regel 4 låter Gemini sortera bort dem;
+  en reranker är nästa steg.
+- Relevansgränserna (`MIN_SIMILARITY` i `answer.py`) är handkalibrerade.
+- Partiernas webbplatser ändras utan förvarning; källistan visar när sidan
+  senast ändrades.

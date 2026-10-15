@@ -86,8 +86,8 @@ def main():
 
     with st.expander('Exempel på frågor'):
         for example in ('Vad tycker Vänsterpartiet om kärnkraft?',
-                        'Vilka motioner har S lagt om gifttunnor i Sundsvallsbukten?',
-                        'Hur röstade S om kärnkraft?'):
+                        'Vad vill Sverigedemokraterna göra åt gängkriminaliteten?',
+                        'Vad har regeringen föreslagit om föräldrapenningen?'):
             st.write(example)
 
     chat = st.session_state.setdefault('chat', [])
@@ -117,8 +117,9 @@ def main():
                 result = {
                     'question': question.strip(), 'answer': response,
                     'sources': bot.source_list(hits), 'links': links, 'info': info,
-                    'layers': [LAYER_NAMES.get(layer, layer) for layer in
-                               sorted({m['layer'] for m in idx.meta})],
+                    # The layers that are searched, not every layer in the
+                    # index: DID (votes) is still indexed but switched off.
+                    'layers': [LAYER_NAMES.get(layer, layer) for layer in bot.ALL_LAYERS],
                 }
             chat.append(result)
             render_result(result)

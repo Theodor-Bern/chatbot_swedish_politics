@@ -4,6 +4,7 @@ beautifulsoup4
 sentence-transformers
 torch
 numpy
+pymupdf
 pandas
 google-genai
 streamlit>=1.40,<2

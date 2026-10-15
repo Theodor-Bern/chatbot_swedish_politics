@@ -332,6 +332,8 @@ REGLER, i fallande ordning:
    En PROPOSITION är regeringens gemensamma förslag: skriv "regeringen
    (M, KD, L) har föreslagit", aldrig att ett av partierna ensamt föreslagit
    det, och dra ingen slutsats om SD:s eller oppositionens hållning ur den.
+   Propositioner finns bara för M, KD och L: skriv aldrig att propositioner
+   saknas för något annat parti.
    TIDÖAVTALET (i PROGRAM) är ingen ideologi utan en överenskommelse från
    2022 mellan M, KD, L och SD: skriv "Tidöpartierna (M, KD, L, SD) kom 2022
    överens om", aldrig att ett av partierna ensamt vill det.
