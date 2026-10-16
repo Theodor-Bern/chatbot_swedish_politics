@@ -1,18 +1,16 @@
 """
 answer.py — the answering step. This is where the LLM comes in, and nowhere else.
 
-The chain:
-    question
-      -> parties_in_question()  parameter extraction: "moderaterna" -> M
+The chain (answer_with_tools, what the app uses):
+    question (+ chat history)
+      -> Gemini                 decides which searches to make ('sok' tool)
       -> retrieve()             retrieval, with fixed slots per party and layer
-      -> vote_facts()           looks up the votes for the retrieved punkter
-      -> build_context()        all of the above as text, with a source id on each piece
-      -> Gemini                 phrases the answer. The model may NEVER invent facts.
+      -> build_context()        numbered passages, a source on each
+      -> Gemini                 writes the answer, citing the numbers
 
 The system prompt follows the lecture's four steps: who it is, what it knows
-(the Q&A pairs that teach it the Riksdag's semantics), which data to use, and
-how to answer. Everything Gemini reads is Swedish on purpose — the bot
-answers in Swedish.
+(Q&A pairs about the material), which data to use, and how to answer. It is
+in Swedish, like the material; the answer follows the question's language.
 
 Needs a key from Google AI Studio:
     export GEMINI_API_KEY=...        # NEVER put the key in the repo
@@ -34,38 +32,24 @@ import os
 import re
 import sys
 import time
-from functools import lru_cache
 from collections import defaultdict
 
 import rag_index
 
-try:
-    import party_positions
-except ImportError:
-    party_positions = None
-
 MODEL = "gemini-3.5-flash-lite"
 MAX_CONTEXT_CHARS = 40000
-# A motion's argument can be several thousand characters. With 8 parties in the
-# prompt, the start is enough to show what the yrkande is about, and more would
-# crowd out other parties. A single-party question has room for more of the
-# reasoning — which is what "vad innebär de i praktiken?" needs.
+# Characters of a motion's argument shown per hit: less when 8 parties share
+# the prompt, more when one party has it to itself.
 MAX_ARGUMENT_CHARS = {"one_party": 1500, "several_parties": 600}
 MAX_OUTPUT_TOKENS = 4096
-# Gemini 3 "thinks" before answering, and the thinking counts against
-# max_output_tokens. We want the given text restated, not reasoning — that
-# saves both quota and waiting time. None = let the model decide.
+# Gemini 3 thinks before answering, which costs output tokens and time.
+# None = let the model decide.
 THINKING_LEVEL = "MINIMAL"
-POSITIONS_DID = "out/positions_did.jsonl"
-DID_CHUNKS = rag_index.DID_CHUNKS
-MAX_VOTE_POINTS = 6           # betänkande punkter in the vote block
-MAX_RESERVATION_CHARS = 350   # characters from each reservation's ställningstagande
 
 
 PARTY_NAMES = rag_index.PARTY_NAMES
 
-# Parameter extraction: free text -> party code. A deterministic table instead
-# of an LLM call — party names are a closed set and need no model.
+# Party names are a closed set, so a lookup table replaces an LLM call.
 ALIAS = {
     "s": "S", "socialdemokraterna": "S", "socialdemokraterna s": "S",
     "sossarna": "S", "socialdemokratiska arbetarepartiet": "S",
@@ -80,7 +64,8 @@ ALIAS = {
 
 # Questions where the right answer is NOT to answer (voting advice).
 VOTING_ADVICE_WORDS = re.compile(
-    r"vilket parti (ska|bör) jag|passar mig|rösta på|vem ska jag rösta|"
+    r"vilket parti (ska|bör) jag|vilket parti är bäst|bästa partiet|passar mig|"
+    r"rösta på|vem ska jag rösta|"
     r"rekommendera(r)? du|vad ska jag rösta|hjälp mig välja", re.IGNORECASE)
 
 
@@ -101,110 +86,11 @@ def parties_in_question(question):
     return found
 
 
-# Every question searches all layers. There's deliberately no keyword routing:
-# guessing layers from words misfired ("använd inga betänkanden" routed TO
-# betänkanden), and a question that mentions votes still deserves the party's
-# motions and website for context. Gemini reads the question and decides what
-# to emphasise; --layer on the CLI restricts retrieval by hand.
-# ponytail: "did" (votes) switched off for now; add it back here to re-enable.
+# Every question searches all layers; Gemini decides what to emphasise.
 ALL_LAYERS = ["program", "motion", "proposition", "said"]
 # Propositions are the government's: only these parties are searched for them,
 # so the opposition doesn't get a "no propositions" gap on every question.
 GOVERNMENT = {"M", "KD", "L"}
-
-
-# --------------------------------------------------------------------------
-# vote facts for the punkter that retrieval hit
-# --------------------------------------------------------------------------
-
-@lru_cache(maxsize=1)
-def punkt_texts():
-    """What makes a vote understandable, per betänkande punkt: its heading,
-    the committee's proposal in brief, and what each reservation wanted (its
-    ställningstagande). From the same chunks.jsonl as the DID layer."""
-    heading, summary, reservation = {}, {}, {}
-    for line in open(DID_CHUNKS, encoding="utf-8"):
-        d = json.loads(line)
-        doc = (d["rm"], d["beteckning"])
-        punkter = [p for p in str(d.get("punkter") or "").split(";") if p]
-        if d["section"] == "decision" and punkter:
-            heading[doc + (punkter[0],)] = d["heading"]
-        elif d["section"] == "summary":
-            for p in punkter:
-                summary.setdefault(doc + (p,), d["text"])
-        elif d["section"] == "reservation" and d.get("number"):
-            text = d["text"]
-            i = text.find("Ställningstagande")
-            if i != -1:
-                text = text[i + len("Ställningstagande"):].strip()
-            reservation[doc + (d["number"],)] = text
-    return heading, summary, reservation
-
-
-def shorten(text, n):
-    return text if len(text) <= n else text[:n].rsplit(" ", 1)[0] + " …"
-
-
-def vote_facts(hits, parties):
-    """One block per betänkande punkt that retrieval hit: what the punkt was
-    about, what the reservations wanted, and how each party voted.
-
-    A bare line like "L röstade mot reservation 1 (S)" says nothing unless you
-    know what reservation 1 proposed — so the reservations' content sits in
-    the same block as the votes. The block text is Swedish: Gemini reads it.
-
-    Without an explicit party filter ALL parties are looked up, not just the
-    ones that happen to be tagged on the hit's reservation. Government parties
-    practically never file reservations (see KNOWLEDGE), so without this their
-    "voted with the majority" stance would never show.
-    """
-    if party_positions is None or not os.path.exists(POSITIONS_DID):
-        return []
-    positions = party_positions.load_positions(POSITIONS_DID)
-    heading, summary, reservation = punkt_texts()
-    seen, blocks = set(), []
-    for _score, m in hits:
-        if m["layer"] != "did" or not m.get("punkt"):
-            continue
-        key = f"{m['rm']}|{m['beteckning']}|{m['punkt']}"
-        row = positions.get(key)
-        if row is None or key in seen:
-            continue
-        seen.add(key)
-        punkt = (m["rm"], m["beteckning"], m["punkt"])
-
-        dates = sorted({v["datum"] for v in row["voteringar"] if v.get("datum")})
-        lines = [f"[{m['beteckning']} {m['rm']} punkt {m['punkt']}] "
-                 f"{m.get('doc_title', '')} — {heading.get(punkt, '')}".rstrip(" —")
-                 + (f" (votering {', '.join(dates)})" if dates else "")]
-        if punkt in summary:
-            lines.append(f"Utskottets förslag: {summary[punkt]}")
-        for r in row["reservationer"]:
-            wanted = reservation.get(punkt[:2] + (r["number"],))
-            if wanted:
-                lines.append(f"Reservation {r['number']} ({', '.join(r['partier'])}) "
-                             f"ville: {shorten(wanted, MAX_RESERVATION_CHARS)}")
-        if row["status"] == "no_vote":
-            lines.append("Ingen votering hölls; punkten avgjordes med acklamation, "
-                         "så inget parti tog ställning i en omröstning. Reservationerna "
-                         "ovan visar vad partierna bakom dem ville.")
-        else:
-            lines.append("Så agerade partierna:")
-            for p in (parties or PARTY_NAMES):
-                described = party_positions.describe(row, p)
-                # A party with its own reservation abstains when a different
-                # reservation is being voted on — pure procedure, it says nothing
-                # about the issue. The party's position is its own reservation,
-                # which is already listed above.
-                stances = {v["partier"][p]["stance"] for v in row["voteringar"]
-                           if p in v["partier"]}
-                if described["own_reservations"] and stances == {"Avstår"}:
-                    continue
-                lines.append(f"- {described['text']}")
-        blocks.append("\n".join(lines))
-        if len(blocks) >= MAX_VOTE_POINTS:
-            break
-    return blocks
 
 
 # --------------------------------------------------------------------------
@@ -222,17 +108,11 @@ def enskild(m):
     return len([s for s in m.get("undertecknare", "").split(";") if s]) == 1
 
 
-def build_context(hits, votes, argument_chars, limit=MAX_CONTEXT_CHARS, start=1):
+def build_context(hits, argument_chars, limit=MAX_CONTEXT_CHARS, start=1):
     """The retrieved material as text. Passages are numbered from `start`;
     limit=None keeps every passage (tool results: a numbered passage must
     never be dropped, or a cited number would point at nothing)."""
-    parts, n = [], 0
-    if votes:
-        block = "OMRÖSTNINGAR I RIKSDAGEN\n\n" + "\n\n".join(votes)
-        parts.append(block)
-        n += len(block)
-
-    parts.append("\nHÄMTADE TEXTER")
+    parts, n = ["\nHÄMTADE TEXTER"], 0
     for i, (_score, m) in enumerate(hits, start):
         if m.get("layer") == "motion":
             source = f"motion {m.get('beteckning', '')} {m.get('rm', '')}"
@@ -243,7 +123,7 @@ def build_context(hits, votes, argument_chars, limit=MAX_CONTEXT_CHARS, start=1)
         elif m.get("layer") == "program":
             source = f"{m.get('doc_type', 'partiprogram')}, s. {m.get('page')}"
         else:
-            source = m.get("url") or f"{m.get('beteckning', '')} {m.get('rm', '')}"
+            source = m.get("url", "")
         piece = f"\n[{i}] {m['layer'].upper()} — {m['kontext']}\nkälla: {source}\n{m['text']}"
         if m.get("layer") == "motion" and m.get("sektion_text"):
             argument = m["sektion_text"]
@@ -274,13 +154,10 @@ def source_list(hits):
             year = f" {m['year']}" if m.get("year") else ""
             source = (f"{m.get('doc_type', 'partiprogram')} ({m.get('parti', '').replace(';', ', ')}){year}, "
                       f"p. {m.get('page')} – {m.get('heading', '')}").rstrip(" –")
-        elif m.get("url"):
+        else:
             # Parties edit their pages without notice: show how current it is.
             edited = f" (last edited {m['lastmod'][:10]})" if m.get("lastmod") else ""
-            source = m["url"] + edited
-        else:
-            punkt = f" punkt {m['punkt']}" if m.get("punkt") else ""
-            source = f"{m.get('beteckning', '')} {m.get('rm', '')}{punkt}"
+            source = m.get("url", "") + edited
         numbers.setdefault(source, []).append(str(i))
     return [f"[{', '.join(n)}] {s}" for s, n in numbers.items()]
 
@@ -314,15 +191,18 @@ REGLER, i fallande ordning:
 
 3. Du rekommenderar ALDRIG ett parti och rangordnar dem aldrig. Du säger
    inte vilket parti som "passar" någon, oavsett hur användaren beskriver
-   sig. Om du blir ombedd förklarar du kort att du redovisar vad partierna
-   säger och gör, och erbjuder en jämförelse i en sakfråga användaren väljer.
+   sig. Om du blir ombedd förklarar du kort att du inte rangordnar partier,
+   och redovisar sedan neutralt vad varje parti själv säger och föreslår i
+   den sakfråga frågan gäller (t.ex. pensioner), utan att värdera.
 
 4. Använd bara källor som faktiskt besvarar frågan. En hämtad passage som
    handlar om något annat utelämnar du, även om den är det enda du har för
    ett parti — använd aldrig en källa om ett annat ämne som om den handlade
    om det efterfrågade. Saknas material fyller du aldrig luckan med
    gissningar. Luckorna samlar du i EN kort mening i slutet av svaret
-   ("I materialet saknas motioner från C och KD."), inte en gång per parti.
+   ("C:s och KD:s motioner tar inte upp frågan."), inte en gång per parti.
+   Att inget hittades betyder att källan inte tar upp frågan: skriv aldrig
+   att ett partis program, motioner eller webbplats "saknas".
 
 5. En MOTION är ett förslag partiet lämnat in — inte ett beslut och inte en
    lag. Skriv alltid "X har föreslagit" eller "X vill", ALDRIG "X har
@@ -342,9 +222,9 @@ REGLER, i fallande ordning:
    utan att kalla det åsiktsbyte.
 
 7. Gäller frågan ETT parti: ordna svaret efter materialtyp under rubrikerna
-   Grundsyn (PROGRAM), Vad partiet säger (SAID), Vad partiet föreslagit
-   (MOTION), Vad regeringen föreslagit (PROPOSITION), och hoppa över
-   rubriker du saknar material för. Jämför du FLERA partier: INGA rubriker per
+   Grundsyn, Vad partiet säger, Vad partiet föreslagit och Vad regeringen
+   föreslagit (översatta till frågans språk, utan lagernamn som PROGRAM eller
+   SAID), och hoppa över rubriker du saknar material för. Jämför du FLERA partier: INGA rubriker per
    materialtyp. Ett stycke per parti, partierna i samma ordning, och inom
    stycket källtyperna i ordningen ovan.
 
@@ -358,7 +238,9 @@ regeringens propositioner (PROPOSITION).
 Ta BARA med de källtyper som faktiskt besvarar
 frågan — ordningen är ingen checklista, och en motion om en
 annan sakfråga hör inte hemma i ett svar om ideologi. Slå aldrig ihop källor
-av olika typ i samma påstående. Avsluta aldrig med en sammanfattande
+av olika typ i samma påstående. Det ett parti skriver på sin webbplats är
+partiets egen beskrivning: skriv "M uppger på sin webbplats att regeringen har
+…", aldrig som ett faktum. Avsluta aldrig med en sammanfattande
 värdering av vilket parti som har rätt."""
 
 
@@ -367,8 +249,8 @@ värdering av vilket parti som har rätt."""
 KNOWLEDGE = [
     ("Vad betyder det att ett parti saknar sida om ett ämne på sin webbplats?",
      "Bara att ämnet inte finns i partiets eget A–Ö-register. Det betyder "
-     "inte att partiet saknar åsikt i frågan. Skillnaden ska alltid skrivas "
-     "ut: materialet saknas, slutsatsen om partiets uppfattning uteblir."),
+     "inte att partiet saknar åsikt i frågan. Skriv att partiets webbplats "
+     "inte tar upp frågan, och dra ingen slutsats om partiets uppfattning."),
     ("Vad är ett partiprogram, och spelar det roll hur gammalt det är?",
      "Partiprogrammet (även idé- eller principprogram) är partiets antagna "
      "beskrivning av sin ideologi och sina grundvärderingar, beslutad av "
@@ -426,12 +308,10 @@ KONTEXT rätt. Den är ingen källa om partiernas politik.
 """ + "\n\n".join(f"F: {q}\nS: {a}" for q, a in KNOWLEDGE)
 
 
-# Chat memory: the last exchanges are sent again with each question (the API
-# keeps no state). Only question + answer text, not the retrieved passages:
-# those would multiply the tokens per call on the free tier.
+# Chat memory: earlier questions and answers are sent again with each question
+# (the API keeps no state), without their passages to save tokens.
 HISTORY_TURNS = 20
-# Passage numbers restart at [1] for every question, so an old "[3]" would
-# point at a new question's passage 3. Old answers lose their citations.
+# Passage numbers restart for every question, so old answers lose their citations.
 CITATION = re.compile(r"\s*\[\d+(?:\s*[,–-]\s*\d+)*\]")
 
 
@@ -446,7 +326,8 @@ def history_turns(history):
 
 VOTING_ADVICE_NOTE = ("\n\nOBS: användaren ber om en partirekommendation. "
                       "Följ regel 3 — rekommendera inte, förklara kort "
-                      "varför, och erbjud en sakfrågejämförelse.\n")
+                      "varför, och sök sedan och redovisa neutralt vad "
+                      "partierna säger i sakfrågan.\n")
 
 
 def build_contents(question, context, voting_advice):
@@ -469,15 +350,12 @@ def gemini_client():
     return genai.Client(api_key=key)
 
 
-# Tried in order when the main model is overloaded (or over quota — the free
-# tier counts quota per model). A model this key can't use (404 NOT_FOUND) is
-# skipped at once. Check the names with `python answer.py models`.
-# gemini-2.5-flash is closed to new keys (404); 3.6-flash was the main model before 3.8.
+# Tried in order when the main model is overloaded or over quota.
+# Check the available names with `python answer.py models`.
 FALLBACK_MODELS = ["gemini-3.6-flash"]
 SWITCH_AFTER = 2        # transient failures on one model before moving on
-# Which thinking variant each model accepted (index into `variants` below).
-# Saved to disk: a rejected variant is a request that counts against the
-# free tier's daily quota, so it must be discovered once, not on every run.
+# Which thinking variant each model accepted, saved so that a rejected variant
+# (a wasted request) is only tried once.
 THINKING_CACHE = "out/gemini_thinking.json"
 try:
     _THINKING_OK = json.load(open(THINKING_CACHE))
@@ -494,10 +372,8 @@ def _remember_thinking(model, v):
             pass            # only an optimisation — never fail an answer over it
 
 
-# Attempts per Gemini call, across all models. Kept low on purpose: it's not
-# documented whether failed (503) attempts count against the free tier's ~20
-# requests a day, so when Google is overloaded it's cheaper to stop and try
-# again later than to keep retrying.
+# Attempts per Gemini call. Kept low: when Google is overloaded, stopping is
+# cheaper than retrying against a small daily quota.
 MAX_ATTEMPTS = 2
 
 
@@ -518,10 +394,8 @@ def generate(client, model, contents, system=SYSTEM, attempts=MAX_ATTEMPTS,
             max_output_tokens=MAX_OUTPUT_TOKENS,
             **config, **extra)
 
-    # Gemini 3 controls thinking with thinking_level, older models with
-    # thinking_budget, and some allow neither. The API only answers "invalid
-    # argument" without saying which argument was wrong, so we try the
-    # variants in turn instead of parsing the text.
+    # Models differ in which thinking setting they accept, and the API doesn't
+    # say which argument was invalid, so the variants are tried in turn.
     variants = []
     if THINKING_LEVEL:
         variants.append(("thinking_level",
@@ -530,11 +404,8 @@ def generate(client, model, contents, system=SYSTEM, attempts=MAX_ATTEMPTS,
                          types.ThinkingConfig(thinking_budget=0)))
     variants.append(("no thinking config", None))
 
-    # Transient errors, both common on the free tier:
-    #   429 RESOURCE_EXHAUSTED  we've hit the quota
-    #   503 UNAVAILABLE         Google is overloaded right now
-    # Jitter, so three group members running at the same time don't retry
-    # in lockstep.
+    # Transient errors: 429 (quota) and 503 (overloaded). Jitter keeps group
+    # members from retrying in lockstep.
     TRANSIENT = ("429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE",
                  "500", "INTERNAL", "504", "DEADLINE_EXCEEDED")
 
@@ -628,9 +499,7 @@ def list_models():
     key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not key:
         sys.exit("set GEMINI_API_KEY")
-    # The client must stay alive while we iterate: models.list() is a lazy
-    # pager that fetches pages only on iteration, and a temporary client gets
-    # closed before then ("client has been closed").
+    # Keep the client alive: models.list() fetches its pages lazily.
     client = genai.Client(api_key=key)
     for m in list(client.models.list()):
         actions = getattr(m, "supported_actions", None) or []
@@ -642,33 +511,24 @@ def list_models():
 # main flow
 # --------------------------------------------------------------------------
 
-# How many passages each layer gets per party. Every party and layer is
-# searched separately: in a shared pool the websites' polished prose almost
-# always beats short motion yrkanden on pure vector similarity. Motions weigh
-# most — they are the party's concrete, dated proposals; the website is
-# self-description.
-# A single party has room for more: the prompt for one party used ~5,500 of
-# 40,000 characters, and "vilka motioner har M gjort…" got only 4 motions. The
-# relevance cutoff still drops weak hits, so a bigger quota adds room, not noise.
+# Passages per layer and party. Each party and layer is searched separately,
+# since website prose otherwise outranks short motion text. Motions get the
+# most room: they are the party's concrete proposals.
 LAYER_QUOTA = {
-    "one_party": {"program": 3, "motion": 8, "proposition": 3, "did": 4, "said": 3},
-    "several_parties": {"program": 1, "motion": 2, "proposition": 1, "did": 1, "said": 1},   # per party
+    "one_party": {"program": 3, "motion": 8, "proposition": 3, "said": 3},
+    # Bills are shared by M, KD and L, so 2 each gives a government question 6.
+    "several_parties": {"program": 1, "motion": 2, "proposition": 2, "said": 1},   # per party
 }
-# Relevance cutoff on cosine similarity. e5's values are tightly packed (often
-# 0.80–0.90), so the cutoff is relative to the question's best hit, plus an
-# absolute floor for questions no party has material on. An empty slot is left
-# empty and stated in the prompt, instead of being filled with the least bad hit.
-# The floors were set on 7 test questions (2026-09-28): motions at 0.82 were
-# relevant, DID hits below 0.83 were not (e.g. water management on a nuclear question).
-# ponytail: hand-calibrated, replace with a reranker (PLAN step 5) if the floors don't hold.
+# Relevance cutoff on cosine similarity: within MAX_DISTANCE of the best hit
+# and above a floor. An empty slot stays empty rather than holding a weak hit.
+# The floors were set by hand on a few test questions; e5's similarities are
+# tightly packed (0.80–0.90), and a reranker would be the next step.
 MAX_DISTANCE = 0.04
-# Government parties file no group motions (2022–2026: M 0, KD 0, L 1
-# kommittémotion; their policy goes into propositions), so their motion slots
-# filled up with backbenchers' local requests. At most this many enskilda motions per party; the rest stay empty.
-# 0 = never: an enskild motion is one member's wish, not the party's line.
+# Enskilda motions per party. 0 = never: they are one or a few members'
+# wishes, often local, not the party's line.
 MAX_ENSKILDA = 0
-# ponytail: proposition floor copied from motion, not calibrated yet.
-MIN_SIMILARITY = {"program": 0.80, "motion": 0.80, "proposition": 0.80, "said": 0.80, "did": 0.83}
+# The proposition floor is copied from motion and not calibrated.
+MIN_SIMILARITY = {"program": 0.80, "motion": 0.80, "proposition": 0.80, "said": 0.80}
 
 
 def retrieve(idx, question, parties, layers=ALL_LAYERS, method="hybrid",
@@ -694,9 +554,8 @@ def retrieve(idx, question, parties, layers=ALL_LAYERS, method="hybrid",
             slots[party, one_layer] = (n, idx.search(
                 question, k=n + 20, party=[party], layer=one_layer, method=method))
 
-    # The cutoff is computed per layer: website prose systematically gets
-    # higher similarity than motion yrkanden, so a shared cutoff would cut
-    # exactly the motions the quotas are meant to make room for.
+    # Per-layer cutoff: website prose scores higher than motion text, so a
+    # shared cutoff would drop the motions.
     best = defaultdict(float)
     for (_, one_layer), (_, candidates) in slots.items():
         for _, m in candidates:
@@ -715,11 +574,15 @@ def retrieve(idx, question, parties, layers=ALL_LAYERS, method="hybrid",
                 if singles == MAX_ENSKILDA:
                     continue
                 singles += 1
-            taken += 1          # a shared reservation counts for each party,
+            # Bills are shared by M, KD and L: each party's slot takes a new one.
+            if one_layer == "proposition" and m["id"] in seen:
+                continue
+            taken += 1          # a shared chunk counts for each party,
             if m["id"] not in seen:      # but is shown only once
                 seen.add(m["id"])
                 hits.append((score, m))
-        if not taken:
+        # Government parties have no group motions: an empty slot is no gap.
+        if not taken and not (one_layer == "motion" and party in GOVERNMENT):
             gaps.append((party, one_layer))
     hits.sort(key=lambda t: -t[1].get("similarity", t[0]))
     return hits, gaps
@@ -730,17 +593,15 @@ def answer(idx, question, method="hybrid", model=MODEL, dry_run=False, layer=Non
     layers = [layer] if layer else ALL_LAYERS
     voting_advice = bool(VOTING_ADVICE_WORDS.search(question))
     hits, gaps = retrieve(idx, question, parties, layers, method)
-    votes = vote_facts(hits, parties)
     size = "one_party" if len(parties) == 1 else "several_parties"
-    context = build_context(hits, votes, MAX_ARGUMENT_CHARS[size])
+    context = build_context(hits, MAX_ARGUMENT_CHARS[size])
     if gaps:
         context += "\n\nINGET RELEVANT MATERIAL HITTADES FÖR\n" + "\n".join(
             f"- {PARTY_NAMES[p]} ({p}): {LAYER_NAMES_SV[l]}" for p, l in gaps)
     contents = build_contents(question, context, voting_advice)
 
     info = {"parties": parties or "all", "layers": ",".join(layers),
-            "hits": len(hits), "gaps": len(gaps),
-            "vote_points": len(votes), "voting_advice": voting_advice,
+            "hits": len(hits), "gaps": len(gaps), "voting_advice": voting_advice,
             "context_chars": len(context)}
 
     if dry_run:
@@ -750,7 +611,7 @@ def answer(idx, question, method="hybrid", model=MODEL, dry_run=False, layer=Non
 
 
 # How a missing layer is named in the prompt (Swedish: Gemini reads it).
-LAYER_NAMES_SV = {"said": "hemsidan", "did": "riksdagsbeslut/voteringar",
+LAYER_NAMES_SV = {"said": "hemsidan",
                   "motion": "motioner", "program": "partiprogrammet",
                   "proposition": "propositioner"}
 
@@ -797,10 +658,8 @@ def search_tool():
         parameters=types.Schema(
             type="OBJECT",
             properties={
-                # A full question, not a keyword: e5 scores one-word queries
-                # much lower (0.77–0.82 vs 0.83–0.86 for "migration"), below
-                # MIN_SIMILARITY, which was calibrated on natural questions —
-                # a keyword search dropped 5 of 8 parties' websites as gaps.
+                # A full question, not a keyword: e5 scores single words far
+                # lower (0.77–0.82 vs 0.83–0.86), below the relevance cutoff.
                 "fraga": types.Schema(
                     type="STRING",
                     description="En fullständig, naturlig fråga om sakfrågan, "
@@ -826,13 +685,12 @@ def call_layers(args):
 
 
 def run_search(idx, args, shown, method="hybrid", searched=None):
-    """Executes one 'sok' call: the same retrieval as the one-call path, for a
-    layer, or all layers if none is given. Returns the text Gemini reads, plus stats. `shown` holds the
-    passages returned so far this question; new ones are numbered after them
-    and appended, so the numbers stay unique across searches."""
+    """Executes one 'sok' call and returns the text Gemini reads, plus stats.
+    `shown` holds the passages returned so far for this question; new ones are
+    numbered after them, so the numbers stay unique across searches."""
     layers = call_layers(args)
     if not set(layers) <= set(ALL_LAYERS):
-        return f"Okänt lager: {args['lager']}. Välj {', '.join(ALL_LAYERS)} eller utelämna.", 0, 0
+        return f"Okänt lager: {args['lager']}. Välj {', '.join(ALL_LAYERS)} eller utelämna.", 0
     parties = [p for p in (args.get("partier") or []) if p in PARTY_NAMES]
     hits, gaps = retrieve(idx, args.get("fraga") or "", parties, layers, method,
                           searched=searched)
@@ -842,15 +700,14 @@ def run_search(idx, args, shown, method="hybrid", searched=None):
     start = len(shown) + 1
     shown.extend(new)
 
-    votes = vote_facts(new, parties) if "did" in layers else []
     size = "one_party" if len(parties) == 1 else "several_parties"
-    text = build_context(new, votes, MAX_ARGUMENT_CHARS[size], limit=None, start=start)
+    text = build_context(new, MAX_ARGUMENT_CHARS[size], limit=None, start=start)
     if gaps:
         text += "\n\nINGET RELEVANT MATERIAL HITTADES FÖR\n" + "\n".join(
             f"- {PARTY_NAMES[p]} ({p}): {LAYER_NAMES_SV[l]}" for p, l in gaps)
     if not new and hits:
         text += "\n\n(Alla träffar i den här sökningen har redan visats ovan.)"
-    return text, len(gaps), len(votes)
+    return text, len(gaps)
 
 
 def answer_with_tools(idx, question, method="hybrid", model=MODEL, history=()):
@@ -868,13 +725,11 @@ def answer_with_tools(idx, question, method="hybrid", model=MODEL, history=()):
         {"role": "user", "parts": [{"text": f"FRÅGA: {question}{note}"}]}]
 
     shown, searches, calls = [], [], 0
-    gaps = vote_points = context_chars = 0
+    gaps = context_chars = 0
     for step in range(TOOL_ROUNDS + 1):
         # The last step may not search: it must answer with what it has.
         mode = "NONE" if step == TOOL_ROUNDS else "AUTO"
-        # After a fallback, the rest of the question stays on that model:
-        # Gemini 3's thought signatures in the history belong to the model
-        # that wrote them.
+        # After a fallback, stay on that model: thought signatures are model-specific.
         response, model = generate(
             client, model, contents, system=SYSTEM + TOOL_INSTRUCTIONS,
             fallbacks=None if step == 0 else [],
@@ -890,39 +745,34 @@ def answer_with_tools(idx, question, method="hybrid", model=MODEL, history=()):
         # The model's turn goes back unchanged: Gemini 3 needs its "thought
         # signatures" in the history to continue after a function call.
         contents.append(response.candidates[0].content)
-        # Several layers searched in the same step share the quota the way the
-        # one-call path does (e.g. 2 motions + 1 vote + 1 website per party);
-        # only a lone search ("bara motioner") gets all the slots. Without
-        # this, three parallel searches fetched three times the material.
+        # Parallel searches share one quota, so three searches don't fetch
+        # three times the material.
         layers_this_step = {l for fc in function_calls for l in call_layers(dict(fc.args or {}))}
-        # Layers nobody searched aren't gaps: without saying so, Gemini wrote
-        # "I materialet saknas motioner…" after a program-only search.
+        # Unsearched layers are named, so Gemini doesn't report them as missing.
         unsearched = [l for l in ALL_LAYERS if l not in layers_this_step]
         results = []
         for i, fc in enumerate(function_calls):
             args = dict(fc.args or {})
             searches.append(f"{args.get('lager') or 'alla lager'}:{','.join(args.get('partier') or []) or 'alla'}"
                             f" \"{args.get('fraga', '')}\"")
-            text, n_gaps, n_votes = run_search(idx, args, shown, method,
+            text, n_gaps = run_search(idx, args, shown, method,
                                                searched=sorted(layers_this_step))
             if unsearched and i == len(function_calls) - 1:
                 text += ("\n\nEJ SÖKTA LAGER: " + ", ".join(LAYER_NAMES_SV[l] for l in unsearched)
                          + ". Påstå inte att material saknas där — det har inte sökts.")
             if i == len(function_calls) - 1:
-                # Gemini answers right after these Swedish results and drifts
-                # into Swedish; the FORM rule alone didn't hold.
+                # After Swedish results Gemini drifts into Swedish; the prompt
+                # rule alone didn't hold.
                 text += (f"\n\nSVARSSPRÅK: skriv svaret på samma språk som frågan "
                          f"\"{question}\" är skriven på, inte på materialets språk.")
             gaps += n_gaps
-            vote_points += n_votes
             context_chars += len(text)
             results.append(types.Part.from_function_response(
                 name=fc.name, response={"result": text}))
         contents.append(types.Content(role="user", parts=results))
 
     info = {"parties": "chosen by Gemini", "layers": " ".join(searches) or "none",
-            "hits": len(shown), "gaps": gaps, "vote_points": vote_points,
-            "voting_advice": voting_advice, "context_chars": context_chars,
+            "hits": len(shown), "gaps": gaps, "voting_advice": voting_advice, "context_chars": context_chars,
             "api_calls": calls, "model": model}
     return answer_text(response), shown, info, contents
 
@@ -930,7 +780,6 @@ def answer_with_tools(idx, question, method="hybrid", model=MODEL, history=()):
 def print_answer(response, hits, info, contents, dry_run):
     print(f"\n[{info['parties']} | layers: {info['layers']} | "
           f"{info['hits']} hits | {info['gaps']} gaps | "
-          f"{info['vote_points']} vote points | "
           f"{info['context_chars']} chars"
           + (f" | {info['api_calls']} API calls" if "api_calls" in info else "")
           + (f" | answered by {info['model']}"
@@ -964,8 +813,7 @@ def main():
         list_models()
         return
 
-    # Tool calling is the default. --dry-run can't use it (every tool step is
-    # an API call), and --layer is a manual restriction for the one-call path.
+    # Tool calling is the default; --dry-run and --layer use the one-call path.
     one_call = a.no_tools or a.dry_run or a.layer
 
     def ask(q):

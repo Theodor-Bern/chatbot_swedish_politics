@@ -1,10 +1,8 @@
 # Data — hämtas från data.riksdagen.se och partiernas webbplatser, se README
 data/
 
-# Härledda filer — återskapas med build_corpus.py, party_positions.py,
-# rag_index.py. Kvalitetsrapporten är ett resultat och sparas.
+# Härledda filer — återskapas med skripten i README
 out/*
-!out/corpus_report.txt
 
 # Python
 __pycache__/

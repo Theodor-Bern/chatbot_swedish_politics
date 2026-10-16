@@ -9,14 +9,14 @@ Varje påstående i svaret hänvisar till en källa.
 
 | Lager | Vad | Källa | Byggs med |
 |---|---|---|---|
-| `program` | Partiernas parti-/principprogram, samt Tidöavtalet (M, KD, L, SD) | PDF i `data/pdf/` | `program.py` |
-| `said` | Vad partierna säger på sina webbplatser | partiernas A–Ö-sidor | `scrapers/scraper.py` |
-| `motion` | Partiernas motioner 2022/23–2025/26, yrkande + motivering | data.riksdagen.se | `motion.py` |
-| `proposition` | Regeringens (M, KD, L) propositioner: sammanfattning, samt reformavsnitten i budget- och vårpropositionerna | data.riksdagen.se | `proposition.py` |
-| `did` | Betänkanden och voteringar | data.riksdagen.se | `parser_riksdagen/`, `party_positions.py` |
+| `program` | Partiernas parti-/principprogram, samt Tidöavtalet (M, KD, L, SD) | PDF i `data/pdf/` | `ingest/program.py` |
+| `said` | Vad partierna säger på sina webbplatser | partiernas A–Ö-sidor | `ingest/scraper.py` |
+| `motion` | Partiernas motioner 2022/23–2025/26, yrkande + motivering | data.riksdagen.se | `ingest/motion.py` |
+| `proposition` | Regeringens (M, KD, L) propositioner: sammanfattning, reformavsnitten i budget- och vårpropositionerna, samt politikens inriktning och reformförslag per utgiftsområde | data.riksdagen.se | `ingest/proposition.py` |
 
-`did` finns kvar i indexet men söks inte: punktvisa reservationer och voteringar
-gav smala, missvisande svar på breda frågor (se `ALL_LAYERS` i `answer.py`).
+Betänkanden och voteringar ingick i en tidigare version men togs bort: punktvisa
+reservationer och voteringar gav smala, missvisande svar på breda frågor. Koden
+finns kvar i git-historiken.
 
 Några medvetna val:
 
@@ -76,33 +76,29 @@ Data och härledda filer ingår inte i Git (`data/` och `out/` är ignorerade).
 Ordningen nedan återskapar allt.
 
 1. **Ladda ner** Riksdagens öppna data (data.riksdagen.se) som HTML till
-   `data/html/`: betänkanden (`bet-2022-2025.html/`), motioner
-   (`mot-2022-2025.html/`) och propositioner (`prop-2022-2025.html/`).
+   `data/html/`: motioner (`mot-2022-2025.html/`) och propositioner
+   (`prop-2022-2025.html/`).
    Lägg partiprogrammen och Tidöavtalet som PDF i `data/pdf/` med filnamnen
-   i `PROGRAMS` i `program.py`.
+   i `PROGRAMS` i `ingest/program.py`.
 2. **Partiernas webbplatser** (SAID):
    ```sh
-   python3 scrapers/scraper.py fetch all
-   python3 scrapers/scraper.py extract all       # -> out/positions_said_*.jsonl
+   python3 ingest/scraper.py fetch all
+   python3 ingest/scraper.py extract all       # -> out/positions_said_*.jsonl
    ```
-3. **Betänkanden** (DID, behövs för indexbygget även om lagret inte söks):
+3. **Motioner** och deras motionstyp från Riksdagens API:
    ```sh
-   python3 parser_riksdagen/build_corpus.py data/html/bet-2022-2025.html out/chunks.jsonl
+   python3 ingest/motion.py build data/html/mot-2022-2025.html out/motion_chunks.jsonl
+   python3 ingest/motion.py subtyp out/motion_subtyp.json
    ```
-4. **Motioner** och deras motionstyp från Riksdagens API:
+4. **Propositioner**:
    ```sh
-   python3 motion.py build data/html/mot-2022-2025.html out/motion_chunks.jsonl
-   python3 motion.py subtyp out/motion_subtyp.json
+   python3 ingest/proposition.py build data/html/prop-2022-2025.html out/proposition_chunks.jsonl
    ```
-5. **Propositioner**:
+5. **Partiprogram och Tidöavtalet**:
    ```sh
-   python3 proposition.py build data/html/prop-2022-2025.html out/proposition_chunks.jsonl
+   python3 ingest/program.py build                       # -> out/program_chunks.jsonl
    ```
-6. **Partiprogram och Tidöavtalet**:
-   ```sh
-   python3 program.py build                       # -> out/program_chunks.jsonl
-   ```
-7. **Index** (BM25 + vektorer med `intfloat/multilingual-e5-large`):
+6. **Index** (BM25 + vektorer med `intfloat/multilingual-e5-large`):
    ```sh
    python3 rag_index.py build
    ```
@@ -113,14 +109,19 @@ Ordningen nedan återskapar allt.
 ## Utvärdering och tester
 
 ```sh
-python3 eval_retrieval.py                          # sökningens kvalitet, inga Gemini-anrop
-python3 eval_retrieval.py --detail P04             # visa träffarna för en fråga
+python3 -m eval.eval_retrieval                          # sökningens kvalitet, inga Gemini-anrop
+python3 -m eval.eval_retrieval --detail P04             # visa träffarna för en fråga
+python3 -m eval.eval_answers run                        # hela svaren, med Gemini (kostar anrop)
+python3 -m eval.eval_answers run --config no_rag        # baslinje: Gemini utan källor
+python3 -m eval.eval_answers sheet                      # -> out/eval_answers/grading.csv
+python3 -m eval.eval_answers report                     # -> out/eval_answers/report.md
 python3 -m unittest discover -s tests -p 'test_app.py'
 ```
 
 Facit i `eval/questions.json` är regler över metadata (lager, parti, ämne),
-inte handplockade passager. Frågetyperna `did`, `jamforelse` och
-`identifierare` testar DID-lagret, som inte längre söks av boten.
+inte handplockade passager. `eval/eval_answers.py` utvärderar hela svaren mot
+frågorna i `eval/answer_questions.json`; betygen sätts för hand i
+`out/eval_answers/grading.csv`.
 
 ## Kända begränsningar
 

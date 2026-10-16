@@ -3,8 +3,8 @@ eval_retrieval.py — measures how good retrieval is, before the answering step.
 
 Ground truth lives in eval/questions.json and is expressed as RULES over
 metadata, not as hand-picked passage ids. A hit is relevant if it meets the
-question's "relevant" condition (right layer, right party, right topic slug,
-right utskott). That keeps the ground truth reviewable by the whole group and
+question's "relevant" condition (right layer, right party, right topic or
+words). That keeps the ground truth reviewable by the whole group and
 robust against rebuilt indexes. The file's keys (sok, fraga, typ, relevant, …)
 and question types are its data format and stay Swedish.
 
@@ -12,19 +12,16 @@ The question types measure different things:
   smal          do we find the right page for ONE party?       -> P@k, MRR
   bred          do ALL parties get a place in the context?     -> party coverage
   saknas        the ground truth is zero hits                  -> false hits
-  did           do we find the right cases in the Riksdag data -> P@k, MRR
-  identifierare do we find a case by its beteckning?           -> P@k, MRR
-  jamforelse    are both layers represented?                   -> layer coverage
 
 Questions without a "relevant" block (e.g. the type 'avrader', which tests the
 answering step, not retrieval) are skipped entirely.
 
 Run:
-    python eval_retrieval.py                        # hybrid
-    python eval_retrieval.py --method bm25          # needs no model
-    python eval_retrieval.py --method bm25 --method vector --method hybrid
-    python eval_retrieval.py --method hybrid --bm25-weight 0.15
-    python eval_retrieval.py --index out/index_v2 --detail B02
+    python3 -m eval.eval_retrieval                        # hybrid
+    python3 -m eval.eval_retrieval --method bm25          # needs no model
+    python3 -m eval.eval_retrieval --method bm25 --method vector --method hybrid
+    python3 -m eval.eval_retrieval --method hybrid --bm25-weight 0.15
+    python3 -m eval.eval_retrieval --index out/index_v2 --detail B02
 """
 
 from __future__ import annotations
@@ -54,12 +51,6 @@ def is_relevant(hit, rule):
         return False
     if rule.get("rm") and hit.get("rm") not in rule["rm"]:
         return False
-    if rule.get("utskott"):
-        # Utskott codes are mixed case (JuU, SfU, MJU) because they come from
-        # the beteckning's prefix. Compare case-insensitively.
-        wanted = {u.lower() for u in rule["utskott"]}
-        if (hit.get("utskott") or "").lower() not in wanted:
-            return False
     if rule.get("sakfraga_regex"):
         if not re.search(rule["sakfraga_regex"], hit.get("sakfraga") or "",
                          re.IGNORECASE):
@@ -109,11 +100,6 @@ def run_question(idx, q, method, bm25_weight=None):
         res["false_hits"] = sum(flags)
         res["top"] = metas[0]["kontext"] if metas else "(no hits at all)"
 
-    if q["typ"] == "jamforelse":
-        layers = {m["layer"] for m, f in zip(metas, flags) if f}
-        res["layers"] = sorted(layers)
-        res["both_layers"] = layers == {"said", "did"}
-
     return res
 
 
@@ -132,8 +118,6 @@ def summarize(results, method):
                     else f"{r['false_hits']} FALSE: {r['top'][:44]}")
         elif r["type"] == "bred" and r.get("parties_missing"):
             note = "missing: " + ",".join(r["parties_missing"])
-        elif r["type"] == "jamforelse":
-            note = "layers: " + (",".join(r["layers"]) or "none")
         elif r["n_rel"] == 0:
             note = "NO RELEVANT HIT"
         print(f"{r['id']:5}{r['type']:14}{r['precision']:7.2f}{r['mrr']:7.2f}"
@@ -148,8 +132,6 @@ def summarize(results, method):
             extra = f"  party coverage {sum(r['coverage'] for r in rs) / len(rs):.2f}"
         if qtype == "saknas":
             extra = f"  questions without false hits {sum(1 for r in rs if not r['false_hits'])}/{len(rs)}"
-        if qtype == "jamforelse":
-            extra = f"  both layers {sum(1 for r in rs if r['both_layers'])}/{len(rs)}"
         print(f"  {qtype:14} n={len(rs):2}  P@k {p:.2f}  MRR {mrr:.2f}{extra}")
 
 

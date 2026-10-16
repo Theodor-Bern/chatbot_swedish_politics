@@ -15,9 +15,9 @@ the text repeats. We find the link through word overlap: which section shares
 the most uncommon words with the yrkande.
 
 Run:
-    python motion.py inspect <one motion>.html
-    python motion.py build data/html/mot-2022-2025.html out/motion_chunks.jsonl
-    python motion.py subtyp out/motion_subtyp.json    # Riksdagen's motion type, from the API
+    python ingest/motion.py inspect <one motion>.html
+    python ingest/motion.py build data/html/mot-2022-2025.html out/motion_chunks.jsonl
+    python ingest/motion.py subtyp out/motion_subtyp.json    # Riksdagen's motion type, from the API
 
 The output is read by rag_index.py (the MOTION layer) — search and answering
 happen there and in answer.py, not here. The output's JSON field names

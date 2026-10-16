@@ -10,6 +10,10 @@ responses, Lagrådet. For a chatbot about party positions only two parts matter:
             that only says "here is the budget". Their policy sits in the
             Finansplan instead: section 1.1, the "Reformer…" section and
             "Politiska utgångspunkter". One record per topic heading.
+  areas     The budget bill also has one volume per expenditure area
+            (utgiftsområde), all numbered :1. From each we keep "Politikens
+            inriktning" and the "Förslag om …" chapters with concrete reforms;
+            the rest is results reporting, legal text and appropriations.
 
 The HTML is a PDF export: one <p> per line or paragraph, page headers and
 page numbers mixed in, no semantic markup. Everything is done on the text.
@@ -18,7 +22,7 @@ Skrivelser (reports to the Riksdag) sit in the same folder and are skipped:
 they report, they don't propose.
 
 Run:
-    python proposition.py build data/html/prop-2022-2025.html out/proposition_chunks.jsonl
+    python ingest/proposition.py build data/html/prop-2022-2025.html out/proposition_chunks.jsonl
 
 The output is read by rag_index.py (the PROPOSITION layer).
 """
@@ -34,8 +38,8 @@ from bs4 import BeautifulSoup
 
 # The Tidö government (M, KD, L) took office on 18 October 2022.
 GOVERNMENT = "M;KD;L"
-# ponytail: the two propositions signed by the previous S government
-# (2022/23:3 and :6, 13 Oct 2022) are skipped; give them parti "S" if they matter.
+# The two bills signed by the previous S government (2022/23:3 and :6,
+# 13 Oct 2022) are skipped.
 PREVIOUS_PM = "Magdalena Andersson"
 
 ID_RE = re.compile(r"Regeringens proposition (\d{4}/\d{2}):(\d+)")
@@ -45,8 +49,21 @@ SUMMARY_RE = re.compile(r"\nPropositionens huvudsakliga innehåll\n(.*?)\nInneh�
 # the title is followed by dot leaders, so it doesn't match.
 HEADING_RE = re.compile(r"\n(\d\.\d)\n([A-ZÅÄÖ][^\n.]{3,90})\n")
 KEEP_TITLE_RE = re.compile(r"^(Reformer|Politiska utgångspunkter)")
+# Expenditure-area volumes: deeper numbering ("3.10.3"), other sections kept.
+AREA_FILE_RE = re.compile(r"031d\d+\.html$")
+AREA_BILL_RE = re.compile(r"Prop\. (\d{4}/\d{2}):1\b")
+AREA_RE = re.compile(r"Utgiftsområde (\d{1,2})\s+(?:–\s+)?([A-ZÅÄÖ][^\n]{3,80})")
+AREA_HEADING_RE = re.compile(r"\n(\d+(?:\.\d+){1,3})\n([A-ZÅÄÖ][^\n.]{3,110})\n")
+AREA_KEEP_RE = re.compile(r"^(Politikens inriktning|Förslag om )")
+# In a "Förslag om …" chapter only the government's own proposal box is kept;
+# the rest is background, consultation responses and impact analysis.
+PROPOSAL_BOX_RE = re.compile(
+    r"\nRegeringens (?:förslag|bedömning)(?: och bedömning)?:?\n(.*?)"
+    r"(?=\n(?:Promemorians|Utredningens|Betänkandets|Delbetänkandets|Remissinstanserna|"
+    r"Skälen för|Lagrådet|Regeringens (?:förslag|bedömning))|\Z)", re.S)
 # Lines that are page furniture or table cells, not prose.
-NOISE_RE = re.compile(r"Prop\.|Prop\. \d{4}/\d{2}:\d+|\d{4}/\d{2}:\d+|[\d\s,.−\-–+%()]+")
+NOISE_RE = re.compile(r"Prop\.|Prop\. \d{4}/\d{2}:\d+|\d{4}/\d{2}:\d+|[\d\s,.−\-–+%()]+"
+                      r"|(Prop\. \d{4}/\d{2}:\d+\s*)?Utgiftsområde \d{1,2}")
 # PDF line-break hyphenation, "hus- hållens" -> "hushållens". Not before
 # "och/eller/…": "arbets- och familjeliv" is real Swedish.
 HYPHEN_RE = re.compile(r"(\w)- (?!och\b|eller\b|samt\b|till\b|som\b)([a-zåäö])")
@@ -101,6 +118,23 @@ def policy_sections(text, budget):
             yield title, text[h.end():nxt.start() if nxt else len(text)]
 
 
+def area_sections(text):
+    """(title, body) for the policy sections of an expenditure-area volume.
+    A section runs to the next heading at the same or a higher level, so a
+    "Förslag om …" chapter keeps its sub-sections."""
+    heads = list(AREA_HEADING_RE.finditer(text))
+    for i, h in enumerate(heads):
+        number, title = h.group(1), h.group(2).strip()
+        if not AREA_KEEP_RE.match(title):
+            continue
+        depth = number.count(".")
+        end = next((n.start() for n in heads[i + 1:] if n.group(1).count(".") <= depth), len(text))
+        body = text[h.end():end]
+        if title.startswith("Förslag om"):
+            body = "\n".join(b.group(1) for b in PROPOSAL_BOX_RE.finditer(body))
+        yield title, body
+
+
 def topic_records(base, section, body):
     """One record per topic heading inside a section; rag_index splits long ones."""
     heading, buf, out = section, [], []
@@ -116,6 +150,8 @@ def topic_records(base, section, body):
 
 
 def parse(path):
+    if AREA_FILE_RE.search(path.name):
+        return parse_area(path)
     title, text = read_text(path, HEAD_BYTES)
     found = ID_RE.search(text[:5000])
     if not found:       # the biggest files have more than HEAD_BYTES of <style> first
@@ -146,6 +182,31 @@ def parse(path):
     return (rm, nr), records
 
 
+def parse_area(path):
+    """One expenditure-area volume of the budget bill, keyed by its area.
+    These volumes say "Prop. 2023/24:1", not "Regeringens proposition …"."""
+    title, text = read_text(path)
+    found = AREA_BILL_RE.search(text[:5000])
+    area = AREA_RE.search(text[:400])      # the title, not a later mention
+    if not found or not area or title.startswith("TEST"):
+        return None, []     # e.g. a second copy of the Finansplan
+    rm = found.group(1)
+    n, name = area.group(1), area.group(2).strip()
+    date = DATE_RE.search(text)
+    base = {"rm": rm, "beteckning": "1", "parti": GOVERNMENT, "file": path.name,
+            "doc_title": f"Budgetpropositionen för {int(rm[:4]) + 1}, utgiftsområde {n} {name}",
+            "datum": date.group(1) if date else ""}
+    records = []
+    for title, body in area_sections(text):
+        for r in topic_records(base, title, body):
+            if r["heading"] != title:       # keep the reform's name on its sub-sections
+                r["heading"] = f"{title} – {r['heading']}"
+            records.append(r)
+    for i, r in enumerate(records):
+        r["chunk_id"] = f"prop:{rm}:1:uo{n}:{i}"
+    return (rm, "1", f"uo{n}"), records
+
+
 def build(html_folder, out_path):
     seen, n_docs, out = set(), 0, []
     files = sorted(Path(html_folder).glob("*.html"))
@@ -156,7 +217,7 @@ def build(html_folder, out_path):
             n_docs += 1
             out.extend(records)
         elif key and key not in seen:
-            print(f"  no text extracted: {path.name} {key[0]}:{key[1]}")
+            print(f"  no text extracted: {path.name} {':'.join(key)}")
         if i % 100 == 0:
             print(f"  {i}/{len(files)} files")
     with open(out_path, "w", encoding="utf-8") as fh:

@@ -1,14 +1,13 @@
 """
-rag_index.py — builds and searches the shared index over all three layers.
+rag_index.py — builds and searches the shared index over all four layers.
 
 SAID    = what the parties say on their websites  (out/positions_said_*.jsonl)
-DID     = what's in the Riksdag's committee reports (out/chunks.jsonl)
 MOTION  = the parties' formal proposals            (out/motion_chunks.jsonl)
 PROGRAM = the parties' adopted party programmes     (out/program_chunks.jsonl)
 PROPOSITION = the government's (M, KD, L) bills    (out/proposition_chunks.jsonl)
 
 Every passage gets a context line in front of its text. The context line is a
-wordalisation of the metadata — "Reservation 1 (C) — AU10 2022/23 punkt 1" —
+wordalisation of the metadata — "Regeringen (M, KD, L), proposition 2025/26:1 …" —
 so both the embedding and the LLM see what the text IS, not just what it says.
 The context lines are Swedish on purpose: they are embedded together with the
 Swedish text, and changing them changes every vector.
@@ -22,7 +21,7 @@ Run:
     python rag_index.py build --bm25-only          # rebuild BM25, keep vectors
     python rag_index.py search "vinster i välfärden"
     python rag_index.py search "klimat" --party V,SD --per-party 3
-    python rag_index.py search "AU10 2022/23" --method bm25 --layer did
+    python rag_index.py search "föräldrapenning" --layer proposition
     python rag_index.py shell
 """
 
@@ -40,9 +39,8 @@ import sys
 from collections import Counter, defaultdict
 
 SAID_GLOB = "out/positions_said_*.jsonl"
-DID_CHUNKS = "out/chunks.jsonl"
 MOTION_CHUNKS = "out/motion_chunks.jsonl"
-MOTION_SUBTYP = "out/motion_subtyp.json"     # python motion.py subtyp
+MOTION_SUBTYP = "out/motion_subtyp.json"     # python ingest/motion.py subtyp
 PROGRAM_CHUNKS = "out/program_chunks.jsonl"
 PROPOSITION_CHUNKS = "out/proposition_chunks.jsonl"
 INDEX_DIR = "out/index"
@@ -59,8 +57,8 @@ RRF_K = 60
 # RRF normally weights the two lists equally. Our evaluation shows BM25 is
 # clearly weaker than the vector list on naturally phrased questions, and an
 # equally weighted merge then PULLS the result below pure vector search.
-# BM25 therefore gets a lower weight: it's there to rescue identifier lookups
-# ("AU10 2022/23", "reservation 14"), not to drive topical ranking.
+# BM25 therefore gets a lower weight: it's there for exact words, names and
+# numbers, not to drive topical ranking.
 RRF_WEIGHT_BM25 = 0.35
 RRF_WEIGHT_VECTOR = 1.0
 
@@ -68,12 +66,6 @@ PARTY_NAMES = {
     "S": "Socialdemokraterna", "M": "Moderaterna", "SD": "Sverigedemokraterna",
     "C": "Centerpartiet", "V": "Vänsterpartiet", "KD": "Kristdemokraterna",
     "MP": "Miljöpartiet", "L": "Liberalerna",
-}
-# Swedish section labels for the DID context line (embedded text — keep as is).
-SECTION_SV = {
-    "summary": "Sammanfattning", "decision": "Utskottets förslag till beslut",
-    "deliberation": "Utskottets överväganden", "reservation": "Reservation",
-    "dissent": "Särskilt yttrande",
 }
 
 # Swedish words that only add noise in BM25. Deliberately short — we don't
@@ -202,25 +194,6 @@ def said_context(d):
     return f"{ctx} ({'; '.join(extra)})" if extra else ctx
 
 
-def did_context(d):
-    section = SECTION_SV.get(d.get("section", ""), d.get("section", ""))
-    parts = [section]
-    if d.get("section") in ("reservation", "dissent") and d.get("number"):
-        parts[0] = f"{section} {d['number']}"
-    parties = [p for p in str(d.get("parties") or "").split(";") if p]
-    if parties:
-        parts[0] += f" ({', '.join(parties)})"
-    where = f"{d.get('beteckning', '')} {d.get('rm', '')}"
-    if d.get("punkter"):
-        where += f" punkt {d['punkter']}"
-    parts.append(where.strip())
-    if d.get("doc_title"):
-        parts.append(d["doc_title"])
-    if d.get("heading"):
-        parts.append(d["heading"])
-    return " — ".join(p for p in parts if p)
-
-
 def motion_context(d):
     party = d.get("parti", "")
     name = PARTY_NAMES.get(party, party)
@@ -276,28 +249,6 @@ def load_records():
                     "kontext": ctx,
                     "text": piece,
                 })
-
-    for line in open(DID_CHUNKS, encoding="utf-8"):
-        d = json.loads(line)
-        ctx = did_context(d)
-        parties = [p for p in str(d.get("parties") or "").split(";") if p]
-        for i, piece in enumerate(split_text(d.get("text", ""))):
-            records.append({
-                "id": f"{d['chunk_id']}#{i}",
-                "parent": d["chunk_id"],
-                "layer": "did",
-                "parti": ";".join(parties),
-                "section": d.get("section", ""),
-                "rm": d.get("rm", ""),
-                "beteckning": d.get("beteckning", ""),
-                "punkt": str(d.get("punkter") or ""),
-                "utskott": d.get("utskott", ""),
-                "number": d.get("number"),
-                "doc_title": d.get("doc_title", ""),
-                "doc_verdict": d.get("doc_verdict", ""),
-                "kontext": ctx,
-                "text": piece,
-            })
 
     subtyp = (json.load(open(MOTION_SUBTYP, encoding="utf-8"))
               if os.path.exists(MOTION_SUBTYP) else {})
@@ -695,7 +646,7 @@ def main():
     s.add_argument("question")
     s.add_argument("-k", type=int, default=8)
     s.add_argument("--party", default="", help="e.g. V,SD")
-    s.add_argument("--layer", choices=["said", "did", "motion", "program", "proposition"])
+    s.add_argument("--layer", choices=["said", "motion", "program", "proposition"])
     s.add_argument("--per-party", type=int, default=None,
                    help="max number of hits per party")
     s.add_argument("--index", default=INDEX_DIR)

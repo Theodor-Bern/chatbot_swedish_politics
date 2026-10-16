@@ -1,11 +1,11 @@
 """Collect what each party says about each issue, from their own websites.
 
-    python3 scrapers/scraper.py discover SD    # dry run: what would be fetched
-    python3 scrapers/scraper.py fetch V        # network, polite, resumable
-    python3 scrapers/scraper.py extract V      # offline, repeatable
+    python3 ingest/scraper.py discover SD    # dry run: what would be fetched
+    python3 ingest/scraper.py fetch V        # network, polite, resumable
+    python3 ingest/scraper.py extract V      # offline, repeatable
 
-    python3 scrapers/scraper.py fetch all      # every party in PARTIES
-    python3 scrapers/scraper.py extract all
+    python3 ingest/scraper.py fetch all      # every party in PARTIES
+    python3 ingest/scraper.py extract all
 
 Paths default to <repo>/data/parties and <repo>/out and are resolved against
 the repository root, so the commands work from any working directory. Pass
@@ -35,7 +35,7 @@ import requests
 import trafilatura
 from bs4 import BeautifulSoup
 
-# This file lives in <repo>/scrapers/, so the repo root is one level up.
+# This file lives in <repo>/ingest/, so the repo root is one level up.
 # Anchoring here means the script does not care where it is run from.
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATA_DIR = REPO_ROOT / "data" / "parties"
@@ -570,9 +570,9 @@ def extract(party_code, data_dir=DEFAULT_DATA_DIR, out_dir=DEFAULT_OUT_DIR):
 # --------------------------------------------------------------------------
 
 USAGE = """usage:
-    python3 scrapers/scraper.py discover <party|all>
-    python3 scrapers/scraper.py fetch    <party|all> [data_dir]
-    python3 scrapers/scraper.py extract  <party|all> [data_dir] [out_dir]
+    python3 ingest/scraper.py discover <party|all>
+    python3 ingest/scraper.py fetch    <party|all> [data_dir]
+    python3 ingest/scraper.py extract  <party|all> [data_dir] [out_dir]
 """
 
 if __name__ == "__main__":

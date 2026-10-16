@@ -12,8 +12,8 @@ larger font, a font other than the body font, bold, or numbering ("2.1 …",
 text itself is unaffected.
 
 Run:
-    python program.py build      ->  out/program_chunks.jsonl
-    python program.py inspect    ->  headings found per programme
+    python ingest/program.py build      ->  out/program_chunks.jsonl
+    python ingest/program.py inspect    ->  headings found per programme
 """
 
 from __future__ import annotations

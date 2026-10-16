@@ -35,11 +35,11 @@ actually supported by the passage it cites is graded by hand in grading.csv:
   neutral      1 = no recommendation, ranking or labels of its own, 0 = not
 
 Run:
-    python eval_answers.py run                          # rag_tools, all questions
-    python eval_answers.py run --config rag_one_call --config no_rag
-    python eval_answers.py run --only E01,B01 --limit 5 --redo
-    python eval_answers.py sheet                        # -> grading.csv, grade by hand
-    python eval_answers.py report --example B01 --example A03
+    python3 -m eval.eval_answers run                          # rag_tools, all questions
+    python3 -m eval.eval_answers run --config rag_one_call --config no_rag
+    python3 -m eval.eval_answers run --only E01,B01 --limit 5 --redo
+    python3 -m eval.eval_answers sheet                        # -> grading.csv, grade by hand
+    python3 -m eval.eval_answers report --example B01 --example A03
 """
 
 from __future__ import annotations
@@ -551,7 +551,7 @@ def report(a):
             m.update({k: g[k] for k in GRADES if g.get(k, "").strip()})
         by_config.setdefault(config, []).append((by_id[qid], m))
     if not by_config:
-        sys.exit(f"no answers in {RESULTS} — run 'python eval_answers.py run' first")
+        sys.exit(f"no answers in {RESULTS} — run 'python3 -m eval.eval_answers run' first")
     configs = [c for c in CONFIGS if c in by_config]
     order = {q["id"]: i for i, q in enumerate(questions)}
     for c in configs:

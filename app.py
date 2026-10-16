@@ -13,8 +13,7 @@ import rag_index
 
 ROOT = Path(__file__).resolve().parent
 INDEX_FILES = ('info.json', 'meta.jsonl', 'vectors.npy', 'bm25.pkl')
-LAYER_NAMES = {'said': 'partisidor', 'did': 'riksdagsmaterial',
-               'motion': 'motioner', 'program': 'partiprogram',
+LAYER_NAMES = {'said': 'partisidor', 'motion': 'motioner', 'program': 'partiprogram',
                'proposition': 'propositioner'}
 
 
@@ -117,8 +116,6 @@ def main():
                 result = {
                     'question': question.strip(), 'answer': response,
                     'sources': bot.source_list(hits), 'links': links, 'info': info,
-                    # The layers that are searched, not every layer in the
-                    # index: DID (votes) is still indexed but switched off.
                     'layers': [LAYER_NAMES.get(layer, layer) for layer in bot.ALL_LAYERS],
                 }
             chat.append(result)
