@@ -212,7 +212,7 @@ CITATION = answer.CITATION
 # The bot saying material is missing, in Swedish or English.
 GAP_RE = re.compile(
     r"saknas|finns (det )?(inget|inga|inte)|inget (relevant )?(material|underlag)|"
-    r"framgår inte|hittade (inget|inga)|inte (något|någon|några) (material|underlag|information)|"
+    r"framgår inte|tar inte upp|hittade (inget|inga)|inte (något|någon|några) (material|underlag|information)|"
     r"no (relevant )?(material|information|sources)|not (in|covered by) the material|"
     r"does not (contain|include|mention)|could not find|lacks?\b", re.IGNORECASE)
 # The bot declining to recommend a party.
@@ -341,7 +341,8 @@ def read_grades():
 def sheet(a):
     questions = load_questions(a.questions)
     order = {q["id"]: i for i, q in enumerate(questions)}
-    latest = [r for r in load_results().values() if not r.get("error")]
+    latest = [r for r in load_results().values()
+              if not r.get("error") and r["id"] in order]
     latest.sort(key=lambda r: (CONFIGS.index(r["config"]), order.get(r["id"], 99)))
     old = read_grades()
     fields = ["config", "id", "typ", "fraga", "answer", "sources"] + GRADES + ["notes"]

@@ -15,14 +15,6 @@ Swedish text, and changing them changes every vector.
 Search is hybrid: BM25 (exact words, beteckningar, numbers) and vectors
 (meaning) are merged with weighted Reciprocal Rank Fusion.
 
-Run:
-    python rag_index.py build                      # embeds only new/changed passages
-    python rag_index.py build --stub               # smoke test without a model
-    python rag_index.py build --bm25-only          # rebuild BM25, keep vectors
-    python rag_index.py search "vinster i välfärden"
-    python rag_index.py search "klimat" --party V,SD --per-party 3
-    python rag_index.py search "föräldrapenning" --layer proposition
-    python rag_index.py shell
 """
 
 from __future__ import annotations
@@ -125,9 +117,7 @@ def yrkande_core(text):
     return text
 
 
-# --------------------------------------------------------------------------
 # 1. load and normalise all layers
-# --------------------------------------------------------------------------
 
 def split_text(text, max_chars=MAX_CHARS, overlap=OVERLAP):
     """Split long text at paragraph and sentence boundaries, never mid-word."""
@@ -321,9 +311,7 @@ def passage_text(p):
     return f"passage: {p['kontext']}\n{text}"
 
 
-# --------------------------------------------------------------------------
 # 2. BM25
-# --------------------------------------------------------------------------
 
 def tokenize(s, drop_party_names=False):
     words = (t.lower() for t in WORD_RE.findall(s))
@@ -384,9 +372,8 @@ class BM25:
         return sorted(scores.items(), key=lambda kv: -kv[1])[:limit]
 
 
-# --------------------------------------------------------------------------
+
 # 3. embeddings
-# --------------------------------------------------------------------------
 
 def stub_vectors(texts, dim=256):
     """Deterministic fake encoder for smoke tests. NOT semantic."""
@@ -426,9 +413,8 @@ def encode_query(text, stub=False, model_name=MODEL_NAME):
                         convert_to_numpy=True).astype("float32")[0]
 
 
-# --------------------------------------------------------------------------
+
 # 4. build
-# --------------------------------------------------------------------------
 
 def embedding_key(p):
     """Hash of exactly the text that gets embedded — same text, same vector."""
@@ -507,9 +493,8 @@ def build(stub=False, model_name=MODEL_NAME, out_dir=INDEX_DIR,
     return records
 
 
-# --------------------------------------------------------------------------
+
 # 5. search
-# --------------------------------------------------------------------------
 
 class Index:
     """Holds the index in memory. Use 'shell' for several questions in a row —
@@ -625,9 +610,9 @@ def show_hits(hits):
         print(f"    {source}   id={m['id']}")
 
 
-# --------------------------------------------------------------------------
+
 # CLI
-# --------------------------------------------------------------------------
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,

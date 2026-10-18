@@ -358,7 +358,8 @@ def inspect(path):
 
 
 RIKSMOTEN = ["2022/23", "2023/24", "2024/25", "2025/26"]
-API = "https://data.riksdagen.se/dokumentlista/?doktyp=mot&rm={rm}&utformat=json&sz=200"
+API = ("https://data.riksdagen.se/dokumentlista/?doktyp=mot&rm={rm}&utformat=json&sz=200"
+       "&sort=datum&sortorder=asc")   # without a fixed order, paging skips motions
 
 
 def fetch_subtyp(out_path):

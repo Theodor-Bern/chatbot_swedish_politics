@@ -8,20 +8,8 @@ The chain (answer_with_tools, what the app uses):
       -> build_context()        numbered passages, a source on each
       -> Gemini                 writes the answer, citing the numbers
 
-The system prompt follows the lecture's four steps: who it is, what it knows
-(Q&A pairs about the material), which data to use, and how to answer. It is
-in Swedish, like the material; the answer follows the question's language.
-
-Needs a key from Google AI Studio:
-    export GEMINI_API_KEY=...        # NEVER put the key in the repo
-
-Run:
-    python answer.py models                         # what the key has access to
-    python answer.py "Vad tycker V om kärnkraft?"
-    python answer.py "Vad tycker partierna om klimatet?"
-    python answer.py "Har M drivit sin kärnkraftslinje?" --dry-run
-    python answer.py chat
 """
+
 
 from __future__ import annotations
 
@@ -69,10 +57,7 @@ VOTING_ADVICE_WORDS = re.compile(
     r"rekommendera(r)? du|vad ska jag rösta|hjälp mig välja", re.IGNORECASE)
 
 
-# --------------------------------------------------------------------------
 # parameter extraction
-# --------------------------------------------------------------------------
-
 def parties_in_question(question):
     """Which parties are named? Empty list = all, i.e. a comparative question."""
     text = f" {question.lower()} "
@@ -93,10 +78,7 @@ ALL_LAYERS = ["program", "motion", "proposition", "said"]
 GOVERNMENT = {"M", "KD", "L"}
 
 
-# --------------------------------------------------------------------------
 # context
-# --------------------------------------------------------------------------
-
 def enskild(m):
     """An enskild motion: one or a few members' proposal, not the party's
     line. Riksdagen's own subtyp; one signer as fallback for the ~6% of
@@ -162,9 +144,7 @@ def source_list(hits):
     return [f"[{', '.join(n)}] {s}" for s, n in numbers.items()]
 
 
-# --------------------------------------------------------------------------
-# system prompt — the lecture's steps 1 and 4 (Swedish: Gemini reads it)
-# --------------------------------------------------------------------------
+# system prompt, try to follow the lecture's steps 1 and 4 
 
 SYSTEM = """Du är en expert på svensk politik. Din uppgift är att leverera pricksäker information om de 8 olika riksdagspartierna i Sverige.
 
@@ -338,17 +318,14 @@ def build_contents(question, context, voting_advice):
         f"FRÅGA: {question}"}]}]
 
 
-# --------------------------------------------------------------------------
-# Gemini
-# --------------------------------------------------------------------------
 
+# Gemini
 def gemini_client():
     from google import genai
     key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not key:
         sys.exit("set GEMINI_API_KEY (key from https://aistudio.google.com)")
     return genai.Client(api_key=key)
-
 
 # Tried in order when the main model is overloaded or over quota.
 # Check the available names with `python answer.py models`.
@@ -369,7 +346,7 @@ def _remember_thinking(model, v):
         try:
             json.dump(_THINKING_OK, open(THINKING_CACHE, "w"))
         except OSError:
-            pass            # only an optimisation — never fail an answer over it
+            pass            # only an optimisation, never fail an answer over it
 
 
 # Attempts per Gemini call. Kept low: when Google is overloaded, stopping is
@@ -507,9 +484,7 @@ def list_models():
             print(f"  {m.name}")
 
 
-# --------------------------------------------------------------------------
 # main flow
-# --------------------------------------------------------------------------
 
 # Passages per layer and party. Each party and layer is searched separately,
 # since website prose otherwise outranks short motion text. Motions get the
@@ -616,9 +591,8 @@ LAYER_NAMES_SV = {"said": "hemsidan",
                   "proposition": "propositioner"}
 
 
-# --------------------------------------------------------------------------
 # tool calling: Gemini decides which layers and parties to search
-# --------------------------------------------------------------------------
+
 
 # Gemini makes all its searches as parallel calls in ONE step, then answers:
 # 2 API calls per question. One extra search step is allowed (3 calls); after
