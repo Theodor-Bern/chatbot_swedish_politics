@@ -42,11 +42,11 @@ def render_result(result):
         st.write(result['question'])
     with st.chat_message('assistant'):
         st.markdown(result['answer'])
-        with st.expander('Källor och hämtat underlag', expanded=True):
-            st.caption('Listan visar hämtade källor, även sådana som inte används i svaret. '
+        with st.expander('Källor', expanded=True):
+            st.caption('Källorna som svaret hänvisar till. '
                        'Flera nummer kan hänvisa till samma dokument.')
             if not result['sources']:
-                st.write('Inga källor hämtades för den här frågan.')
+                st.write('Svaret hänvisar inte till några källor.')
             for source in result['sources']:
                 st.write(source)
             for label, url in result['links']:
@@ -107,15 +107,18 @@ def main():
                         idx, question.strip(), model=model,
                         history=[(r['question'], r['answer']) for r in chat])
                 links, seen = [], set()
+                cited = set(bot.cited_numbers(response))
                 for number, (_, meta) in enumerate(hits, 1):
                     url = meta.get('url', '')
+                    if number not in cited:
+                        continue
                     parsed = urlsplit(url)
                     if parsed.scheme in ('https', 'http') and parsed.netloc and url not in seen:
                         links.append((f'Öppna originalkälla [{number}]', url))
                         seen.add(url)
                 result = {
                     'question': question.strip(), 'answer': response,
-                    'sources': bot.source_list(hits), 'links': links, 'info': info,
+                    'sources': bot.source_list(hits, response), 'links': links, 'info': info,
                     'layers': [LAYER_NAMES.get(layer, layer) for layer in bot.ALL_LAYERS],
                 }
             chat.append(result)

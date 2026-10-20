@@ -58,8 +58,8 @@ python3 -m streamlit run app.py --server.address localhost --browser.gatherUsage
 
 Öppna adressen som visas, normalt http://localhost:8501. Appen minns samtalet
 (de senaste 20 frågorna och svaren), så följdfrågor fungerar. "Nytt samtal" eller
-en omladdning av sidan börjar om. Källistan visar allt hämtat underlag, inte
-bara det som citeras. Starta om appen efter ändringar i koden.
+en omladdning av sidan börjar om. Källistan visar bara källor som svaret
+hänvisar till. Starta om appen efter ändringar i koden.
 
 Appen läser indexet i `out/index`. `POLITICS_INDEX_DIR` kan peka på en annan
 indexmapp.

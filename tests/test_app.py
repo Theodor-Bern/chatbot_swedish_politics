@@ -36,8 +36,9 @@ class AppTests(unittest.TestCase):
         self.addCleanup(responder.stop)
         self.responder.return_value = ('Ett förslag [1].', [
             (1, {'layer': 'said', 'url': 'https://example.org/politik'}),
-            (0.8, {'layer': 'said', 'url': 'https://example.org/politik'})],
-            {'hits': 2, 'model': 'test-model'}, [])
+            (0.8, {'layer': 'said', 'url': 'https://example.org/politik'}),
+            (0.7, {'layer': 'said', 'url': 'https://example.org/ej-citerad'})],
+            {'hits': 3, 'model': 'test-model'}, [])
 
     def app(self):
         return AppTest.from_file(str(APP), default_timeout=15).run()
@@ -65,7 +66,8 @@ class AppTests(unittest.TestCase):
                                                model=answer.MODEL, history=[])
         self.assertTrue(any('Ett förslag [1].' in m.value for m in app.markdown))
         result = app.session_state['chat'][-1]
-        self.assertEqual(result['sources'], ['[1, 2] https://example.org/politik'])
+        # Only cited passages are listed: [2] and [3] are not cited.
+        self.assertEqual(result['sources'], ['[1] https://example.org/politik'])
         self.assertEqual(len(result['links']), 1)
         app.run()
         self.responder.assert_called_once()

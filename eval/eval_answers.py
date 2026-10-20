@@ -217,7 +217,7 @@ GAP_RE = re.compile(
     r"does not (contain|include|mention)|could not find|lacks?\b", re.IGNORECASE)
 # The bot declining to recommend a party.
 REFUSAL_RE = re.compile(
-    r"rekommender|ge (något |några )?råd|tar inte ställning|"
+    r"rekommender|rangordna|ge (något |några )?råd|tar inte ställning|"
     r"inte (säga|avgöra|tala om) vilket parti|recommend|advi[cs]e|"
     r"not (tell|say) (you )?which party", re.IGNORECASE)
 
@@ -242,17 +242,7 @@ EN_WORDS = {"the", "and", "to", "of", "is", "that", "not", "for", "with",
             "has", "wants", "party", "they", "it"}
 
 
-def cited_numbers(text):
-    """Every passage number cited: [3], [3, 5] and [3–5] -> 3, 3 5, 3 4 5."""
-    numbers = []
-    for m in CITATION.finditer(text):
-        for part in m.group().strip()[1:-1].split(","):
-            bounds = [int(x) for x in re.split(r"[–-]", part) if x.strip()]
-            if len(bounds) == 2 and 0 < bounds[1] - bounds[0] < 50:
-                numbers.extend(range(bounds[0], bounds[1] + 1))
-            else:
-                numbers.extend(bounds)
-    return numbers
+cited_numbers = answer.cited_numbers
 
 
 def sentences(text):
@@ -303,7 +293,8 @@ def metrics(row, q):
         m["citation_validity"] = len([n for n in cited if n in hits]) / len(cited) if cited else None
     claims = [s for s in sentences(text) if substantive(s)]
     if claims:
-        m["citation_coverage"] = sum(bool(CITATION.search(s)) for s in claims) / len(claims)
+        m["claims"] = (sum(bool(CITATION.search(s)) for s in claims), len(claims))
+        m["citation_coverage"] = m["claims"][0] / len(claims)
     expected = set(q.get("forvantade_partier") or [])
     if expected:
         m["party_mentioned"] = len(expected & mentioned) / len(expected)
@@ -330,6 +321,14 @@ def comparative(q):
 # grading sheet
 # --------------------------------------------------------------------------
 
+def cited_sources(row):
+    """The source lines the answer cites; results.jsonl keeps every retrieved
+    one, since citation_validity needs them."""
+    cited = set(cited_numbers(row["answer"]))
+    return [s for s in row.get("sources") or []
+            if cited & set(cited_numbers(s.split("]")[0] + "]"))]
+
+
 def read_grades():
     """{(config, id): row} from grading.csv, if it exists."""
     if not GRADING.exists():
@@ -353,7 +352,7 @@ def sheet(a):
         w.writeheader()
         for r in latest:
             row = {k: r.get(k, "") for k in ["config", "id", "typ", "fraga", "answer"]}
-            row["sources"] = "\n".join(r.get("sources") or [])
+            row["sources"] = "\n".join(cited_sources(r))
             prev = old.get((r["config"], r["id"]))
             # Grades only carry over if the answer is the one that was graded.
             if prev and prev.get("answer") == r["answer"]:
@@ -370,6 +369,12 @@ def sheet(a):
 # --------------------------------------------------------------------------
 
 def mean_of(pairs, key, keep=lambda q: True):
+    if key == "citation_coverage":
+        # Pooled over sentences, so a one-sentence answer doesn't weigh as much
+        # as a 25-sentence one. n is then the number of sentences.
+        counts = [m["claims"] for q, m in pairs if keep(q) and "claims" in m]
+        total = sum(t for _, t in counts)
+        return (sum(c for c, _ in counts) / total, total) if total else (None, 0)
     values = [float(m[key]) for q, m in pairs
               if keep(q) and m.get(key) not in (None, "")]
     return (sum(values) / len(values), len(values)) if values else (None, 0)

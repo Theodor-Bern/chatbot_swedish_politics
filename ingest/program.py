@@ -201,6 +201,30 @@ def read_program(path):
              "text": "\n\n".join(s["paragraphs"])} for s in sections]
 
 
+# The Tidö Agreement is seven project directives with the same frame. The
+# frame sections are process text ("Denna projektplan beskriver hur..."), and
+# a reform heading like "Transitcenter ska införas" never says "migration", so
+# the frame is dropped and each heading gets its project's name.
+TIDO_FILE = "tidoavtalet-overenskommelse-for-sverige-slutlig.pdf"
+TIDO_PROJECT_RE = re.compile(r"Direktiv (?:sam ?arbetsprojekt|(andra) sam ?arbetsfrågor) *\n?(.*)")
+TIDO_FRAME_RE = re.compile(r"^(\d\.\s+)?(Inledning|Avgränsningar|Metod och modell|"
+                           r"(\d\.\d\.\s+)?Kommunikation|Ägarskap och arbetsformer|"
+                           r"Inga ytterligare frågor)", re.IGNORECASE)
+
+
+def tido_projects(path):
+    """{page: project name}, carried forward from each directive's title page."""
+    import pymupdf
+    projects, current = {}, ""
+    for pno, page in enumerate(pymupdf.open(path), start=1):
+        m = TIDO_PROJECT_RE.search(page.get_text()[:300])
+        if m and ".." not in m.group(2):         # not the table of contents
+            name = "Andra samarbetsfrågor" if m.group(1) else m.group(2)
+            current = re.sub(r"m (?=[a-zåäö])", "m", name).strip()
+        projects[pno] = current
+    return projects
+
+
 def build():
     OUT.parent.mkdir(parents=True, exist_ok=True)
     with open(OUT, "w", encoding="utf-8") as fh:
@@ -210,6 +234,11 @@ def build():
                 print(f"  missing: {path}")
                 continue
             sections = read_program(path)
+            if filename == TIDO_FILE:
+                projects = tido_projects(path)
+                sections = [{**s, "heading": f"{projects[s['page']]}: {s['heading']}"
+                             if projects[s["page"]] else s["heading"]}
+                            for s in sections if not TIDO_FRAME_RE.match(s["heading"])]
             for i, s in enumerate(sections):
                 fh.write(json.dumps({
                     "chunk_id": f"{party}:program:{i}",

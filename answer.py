@@ -73,6 +73,7 @@ def parties_in_question(question):
 
 # Every question searches all layers; Gemini decides what to emphasise.
 ALL_LAYERS = ["program", "motion", "proposition", "said"]
+LAYER_LABEL_RE = re.compile(r" ?\((?:PROGRAM|SAID|MOTION|PROPOSITION)\)")
 # Propositions are the government's: only these parties are searched for them,
 # so the opposition doesn't get a "no propositions" gap on every question.
 GOVERNMENT = {"M", "KD", "L"}
@@ -120,12 +121,29 @@ def build_context(hits, argument_chars, limit=MAX_CONTEXT_CHARS, start=1):
     return "\n".join(parts)
 
 
-def source_list(hits):
+def cited_numbers(text):
+    """Every passage number cited: [3], [3, 5] and [3–5] -> 3, 3 5, 3 4 5."""
+    numbers = []
+    for m in CITATION.finditer(text):
+        for part in m.group().strip()[1:-1].split(","):
+            bounds = [int(x) for x in re.split(r"[–-]", part) if x.strip()]
+            if len(bounds) == 2 and 0 < bounds[1] - bounds[0] < 50:
+                numbers.extend(range(bounds[0], bounds[1] + 1))
+            else:
+                numbers.extend(bounds)
+    return numbers
+
+
+def source_list(hits, answer=None):
     """One line per source, with every passage number that points to it:
     several passages from the same page/motion must not leave a cited number
-    missing from the list. Numbering matches build_context: hits[0] is [1]."""
+    missing from the list. Numbering matches build_context: hits[0] is [1].
+    Given the answer, only the passages it cites are listed."""
+    cited = set(cited_numbers(answer)) if answer is not None else None
     numbers = {}
     for i, (_score, m) in enumerate(hits, 1):
+        if cited is not None and i not in cited:
+            continue
         if m.get("layer") == "motion":
             source = (f"motion {m.get('rm', '')}:{m.get('beteckning', '')} "
                       f"({m.get('parti') or '?'}) – {m.get('doc_title', '')}").rstrip(" –")
@@ -159,6 +177,10 @@ Det finns fyra olika sorters material.
 
 REGLER, i fallande ordning:
 
+0. Du svarar bara på frågor om svensk politik och riksdagspartierna. Gäller
+   frågan något annat (t.ex. recept, läxhjälp, programmering) säger du kort
+   att du bara svarar på frågor om svensk partipolitik.
+
 1. Du använder ENDAST det material du får i KONTEXT. Du har egna minnen av
    svensk politik — de är föråldrade och du använder dem inte. Om kontexten
    inte räcker säger du det rent ut. Du sätter inga egna etiketter på ett
@@ -173,7 +195,10 @@ REGLER, i fallande ordning:
    inte vilket parti som "passar" någon, oavsett hur användaren beskriver
    sig. Om du blir ombedd förklarar du kort att du inte rangordnar partier,
    och redovisar sedan neutralt vad varje parti själv säger och föreslår i
-   den sakfråga frågan gäller (t.ex. pensioner), utan att värdera.
+   den sakfråga frågan gäller (t.ex. pensioner), utan att värdera. Nämner
+   frågan ingen sakfråga ("Vilket parti ska jag rösta på?") redovisar du inte
+   partiernas politik i allmänhet, utan föreslår att användaren frågar om
+   en sakfråga som är viktig för hen.
 
 4. Använd bara källor som faktiskt besvarar frågan. En hämtad passage som
    handlar om något annat utelämnar du, även om den är det enda du har för
@@ -210,11 +235,12 @@ REGLER, i fallande ordning:
 
 FORM: svara på samma språk som frågan är ställd på, i löpande text. Gäller frågan ett parti: två till fem
 stycken. Jämför du flera partier tar du ett stycke per parti, i samma ordning
-varje gång fånga partiets huvudsakliga
-linje, inte bara en detalj, så länge materialet räcker till det. Inom varje
+varje gång. Fånga partiets huvudsakliga linje, inte bara en detalj, så länge
+materialet räcker till det. Inom varje
 parti håller du isär källtyperna och säger i meningen vilken det är, i den
-här ordningen: partiprogram (PROGRAM), webbplats (SAID), motioner (MOTION),
-regeringens propositioner (PROPOSITION).
+här ordningen: partiprogram, webbplats, motioner, regeringens propositioner.
+Skriv aldrig lagernamnen PROGRAM, SAID, MOTION eller PROPOSITION i svaret, och
+använd ingen fetstil (**).
 Ta BARA med de källtyper som faktiskt besvarar
 frågan — ordningen är ingen checklista, och en motion om en
 annan sakfråga hör inte hemma i ett svar om ideologi. Slå aldrig ihop källor
@@ -306,8 +332,8 @@ def history_turns(history):
 
 VOTING_ADVICE_NOTE = ("\n\nOBS: användaren ber om en partirekommendation. "
                       "Följ regel 3 — rekommendera inte, förklara kort "
-                      "varför, och sök sedan och redovisa neutralt vad "
-                      "partierna säger i sakfrågan.\n")
+                      "varför, och redovisa sedan neutralt vad partierna "
+                      "säger i sakfrågan, om frågan nämner någon.\n")
 
 
 def build_contents(question, context, voting_advice):
@@ -461,7 +487,8 @@ def answer_text(response):
         print(f"  (empty answer, finish_reason={finish or 'unknown'})",
               file=sys.stderr)
         return f"[no answer was generated — finish_reason: {finish or 'unknown'}]"
-    return response.text
+    # The prompt forbids the layer names, but Gemini copies them from the context.
+    return LAYER_LABEL_RE.sub("", response.text)
 
 
 def ask_gemini(contents, model=MODEL):
@@ -549,13 +576,13 @@ def retrieve(idx, question, parties, layers=ALL_LAYERS, method="hybrid",
                 if singles == MAX_ENSKILDA:
                     continue
                 singles += 1
-            # Bills are shared by M, KD and L: each party's slot takes a new one.
-            if one_layer == "proposition" and m["id"] in seen:
+            # Bills (M, KD, L) and the Tidö Agreement (M, KD, L, SD) are shared:
+            # each party's slot takes a new chunk.
+            if m["id"] in seen:
                 continue
-            taken += 1          # a shared chunk counts for each party,
-            if m["id"] not in seen:      # but is shown only once
-                seen.add(m["id"])
-                hits.append((score, m))
+            taken += 1
+            seen.add(m["id"])
+            hits.append((score, m))
         # Government parties have no group motions: an empty slot is no gap.
         if not taken and not (one_layer == "motion" and party in GOVERNMENT):
             gaps.append((party, one_layer))
@@ -701,8 +728,10 @@ def answer_with_tools(idx, question, method="hybrid", model=MODEL, history=()):
     shown, searches, calls = [], [], 0
     gaps = context_chars = 0
     for step in range(TOOL_ROUNDS + 1):
+        # The first step must search: left to choose, Gemini sometimes answered
+        # a voting-advice question from memory, without a single source.
         # The last step may not search: it must answer with what it has.
-        mode = "NONE" if step == TOOL_ROUNDS else "AUTO"
+        mode = "ANY" if step == 0 else "NONE" if step == TOOL_ROUNDS else "AUTO"
         # After a fallback, stay on that model: thought signatures are model-specific.
         response, model = generate(
             client, model, contents, system=SYSTEM + TOOL_INSTRUCTIONS,
@@ -764,7 +793,7 @@ def print_answer(response, hits, info, contents, dry_run):
         return
     print(response)
     print("\nSources:")
-    for line in source_list(hits):
+    for line in source_list(hits, response):
         print(" ", line)
 
 

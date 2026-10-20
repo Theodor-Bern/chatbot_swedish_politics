@@ -216,9 +216,8 @@ def party_codes(argument):
     return [argument]
 
 
-# --------------------------------------------------------------------------
+
 # Discovery
-# --------------------------------------------------------------------------
 
 def xml_bytes(response):
     """Sitemap bytes, decompressed and cleaned up enough to parse.
