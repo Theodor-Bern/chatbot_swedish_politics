@@ -1,0 +1,133 @@
+"""Local web UI. Run from the project root: streamlit run app.py"""
+
+import os
+from pathlib import Path
+import threading
+from urllib.parse import urlsplit
+
+import streamlit as st
+
+import answer as bot
+import rag_index
+
+
+ROOT = Path(__file__).resolve().parent
+INDEX_FILES = ('info.json', 'meta.jsonl', 'vectors.npy', 'bm25.pkl')
+LAYER_NAMES = {'said': 'partisidor', 'motion': 'motioner', 'program': 'partiprogram',
+               'proposition': 'propositioner'}
+
+
+@st.cache_resource(show_spinner=False)
+def load_index(path, fingerprint):
+    # The lock guards the shared model when several tabs are open.
+    return rag_index.Index(path), threading.Lock()
+
+
+def error_message(error):
+    # Never show raw API errors: they can contain keys.
+    text = str(error).lower()
+    if any(word in text for word in ('401', '403', 'api_key_invalid', 'unauthenticated')):
+        return 'Gemini godkände inte åtkomsten. Kontrollera API-nyckeln och dess behörigheter.'
+    if any(word in text for word in ('429', 'quota', 'resource_exhausted')):
+        return 'Gränsen för Gemini-anrop har nåtts. Vänta och försök igen senare.'
+    if any(word in text for word in ('404', 'not_found', 'not available')):
+        return 'Den valda modellen är inte tillgänglig. Kontrollera standardmodellen i answer.py.'
+    if isinstance(error, (FileNotFoundError, OSError)):
+        return 'En fil eller anslutning kunde inte öppnas. Kontrollera indexfilerna och nätverket.'
+    return 'Svaret kunde inte hämtas. Kontrollera nätverket, API-åtkomsten och indexet och försök igen.'
+
+
+def render_result(result):
+    with st.chat_message('user'):
+        st.write(result['question'])
+    with st.chat_message('assistant'):
+        st.markdown(result['answer'])
+        with st.expander('Källor', expanded=True):
+            st.caption('Källorna som svaret hänvisar till. '
+                       'Flera nummer kan hänvisa till samma dokument.')
+            if not result['sources']:
+                st.write('Svaret hänvisar inte till några källor.')
+            for source in result['sources']:
+                st.write(source)
+            for label, url in result['links']:
+                st.link_button(label, url)
+        with st.expander('Om denna sökning'):
+            st.write('Material: ' + ', '.join(result['layers']))
+            st.write(f"Hämtade textavsnitt: {result['info'].get('hits', 0)}")
+            st.write(f"Modell: {result['info'].get('model', '')}")
+
+
+def main():
+    st.set_page_config(page_title='Svensk politik – fråga källorna', page_icon='💬')
+    st.title('Svensk politik')
+    st.write('Utforska vad partierna säger, föreslår och gör i riksdagen.')
+    st.caption('Svar baseras på sparade källor och kan vara ofullständiga. '
+               'Boten minns de senaste frågorna i samtalet, så du kan ställa följdfrågor.')
+
+    index_path = Path(os.environ.get('POLITICS_INDEX_DIR', ROOT / rag_index.INDEX_DIR))
+    model = bot.MODEL
+
+    ready = True
+    if Path.cwd().resolve() != ROOT:
+        st.error('Starta appen från projektets huvudmapp så att boten hittar sina datafiler.')
+        ready = False
+    missing = [name for name in INDEX_FILES if not (index_path / name).is_file()]
+    if missing:
+        st.error('Det valda indexet är ofullständigt. Saknade filer: ' + ', '.join(missing))
+        ready = False
+    key = os.environ.get('GEMINI_API_KEY') or os.environ.get('GOOGLE_API_KEY')
+    if not key:
+        st.warning('API-nyckel saknas. Ange GEMINI_API_KEY i terminalen och starta om appen.')
+        ready = False
+    elif any(c.isspace() for c in key):
+        st.warning('API-nyckeln innehåller blanktecken. Kopiera in nyckeln igen och starta om appen.')
+        ready = False
+
+    with st.expander('Exempel på frågor'):
+        for example in ('Vad tycker Vänsterpartiet om kärnkraft?',
+                        'Vad vill Sverigedemokraterna göra åt gängkriminaliteten?',
+                        'Vad har regeringen föreslagit om föräldrapenningen?'):
+            st.write(example)
+
+    chat = st.session_state.setdefault('chat', [])
+    if chat and st.button('Nytt samtal'):
+        chat.clear()
+    for result in chat:
+        render_result(result)
+
+    question = st.chat_input('Skriv din fråga om svensk politik', disabled=not ready)
+    if question and question.strip():
+        try:
+            with st.spinner('Läser underlaget, söker och formulerar svar…'):
+                # Reload the cached index when its files change.
+                fingerprint = tuple((name, (index_path / name).stat().st_mtime_ns,
+                                     (index_path / name).stat().st_size) for name in INDEX_FILES)
+                idx, lock = load_index(str(index_path), fingerprint)
+                with lock:
+                    response, hits, info, _ = bot.answer_with_tools(
+                        idx, question.strip(), model=model,
+                        history=[(r['question'], r['answer']) for r in chat])
+                # Link buttons only for cited sources, one per URL.
+                links, seen = [], set()
+                cited = set(bot.cited_numbers(response))
+                for number, (_, meta) in enumerate(hits, 1):
+                    url = meta.get('url', '')
+                    if number not in cited:
+                        continue
+                    parsed = urlsplit(url)
+                    if parsed.scheme in ('https', 'http') and parsed.netloc and url not in seen:
+                        links.append((f'Öppna originalkälla [{number}]', url))
+                        seen.add(url)
+                result = {
+                    'question': question.strip(), 'answer': response,
+                    'sources': bot.source_list(hits, response), 'links': links, 'info': info,
+                    'layers': [LAYER_NAMES.get(layer, layer) for layer in bot.ALL_LAYERS],
+                }
+            chat.append(result)
+            render_result(result)
+        except (Exception, SystemExit) as error:
+            st.error(error_message(error))
+
+
+if __name__ == '__main__':
+    main()

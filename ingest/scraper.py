@@ -1,14 +1,11 @@
 """Collect what each party says about each issue, from their own websites.
 
-Two phases, deliberately separate — the same lesson the betänkande parser
-taught: never couple fetching to parsing.
+    python3 ingest/scraper.py discover SD    # dry run: what would be fetched
+    python3 ingest/scraper.py fetch V        # network, polite, resumable
+    python3 ingest/scraper.py extract V      # offline, repeatable
 
-    python3 scrapers/scraper.py discover SD    # dry run: what would be fetched
-    python3 scrapers/scraper.py fetch V        # network, polite, resumable
-    python3 scrapers/scraper.py extract V      # offline, repeatable
-
-    python3 scrapers/scraper.py fetch all      # every party in PARTIES
-    python3 scrapers/scraper.py extract all
+    python3 ingest/scraper.py fetch all      # every party in PARTIES
+    python3 ingest/scraper.py extract all
 
 Paths default to <repo>/data/parties and <repo>/out and are resolved against
 the repository root, so the commands work from any working directory. Pass
@@ -38,7 +35,7 @@ import requests
 import trafilatura
 from bs4 import BeautifulSoup
 
-# This file lives in <repo>/scrapers/, so the repo root is one level up.
+# This file lives in <repo>/ingest/, so the repo root is one level up.
 # Anchoring here means the script does not care where it is run from.
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATA_DIR = REPO_ROOT / "data" / "parties"
@@ -57,6 +54,18 @@ SITEMAP_NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 
 # Shorter than this and trafilatura found navigation, not an article.
 MIN_TEXT_CHARS = 150
+
+# SD's page template embeds its cookie-consent widget's text directly in the
+# HTML body, right after the real content, so trafilatura pulls it in as part
+# of the article — every one of the 245 fetched SD pages has it. It always
+# trails the real content and never precedes it, so cutting the extracted
+# text at its first occurrence recovers the page.
+COOKIE_BOILERPLATE_MARKER = "När du besöker en webbplats kan den lagra"
+
+
+def strip_cookie_boilerplate(text):
+    idx = text.find(COOKIE_BOILERPLATE_MARKER)
+    return text[:idx].rstrip() if idx != -1 else text
 
 
 @dataclass
@@ -186,7 +195,7 @@ PARTIES = {
         index_urls=["https://www.liberalerna.se/politik/"],
         topic_pattern=re.compile(
             r"^https://www\.liberalerna\.se/politik/[^/]+/?$"),
-        robots_checked="2026-09-09",   # Yoast block, allt tillåtet
+        robots_checked="2026-09-09",   # Yoast block, everything allowed
     ),
     # M, KD, L go here — one entry each, no new code.
 }
@@ -207,9 +216,8 @@ def party_codes(argument):
     return [argument]
 
 
-# --------------------------------------------------------------------------
+
 # Discovery
-# --------------------------------------------------------------------------
 
 def xml_bytes(response):
     """Sitemap bytes, decompressed and cleaned up enough to parse.
@@ -386,9 +394,8 @@ def discover(site, session, verbose=True):
     return pages
 
 
-# --------------------------------------------------------------------------
+
 # Phase 1: fetch
-# --------------------------------------------------------------------------
 
 def session_with_agent():
     session = requests.Session()
@@ -463,10 +470,7 @@ def fetch(party_code, data_dir=DEFAULT_DATA_DIR):
         encoding="utf-8")
     print(f"saved {len(index)} pages to {out_dir}")
 
-
-# --------------------------------------------------------------------------
 # Phase 2: extract
-# --------------------------------------------------------------------------
 
 def extract(party_code, data_dir=DEFAULT_DATA_DIR, out_dir=DEFAULT_OUT_DIR):
     """Pull the article text out of the saved HTML.
@@ -507,6 +511,8 @@ def extract(party_code, data_dir=DEFAULT_DATA_DIR, out_dir=DEFAULT_OUT_DIR):
                 include_comments=False,
                 include_tables=True,
             )
+            if text:
+                text = strip_cookie_boilerplate(text)
             if not text or len(text) < MIN_TEXT_CHARS:
                 skipped.append(page["slug"])
                 continue
@@ -555,13 +561,10 @@ def extract(party_code, data_dir=DEFAULT_DATA_DIR, out_dir=DEFAULT_OUT_DIR):
         print(f"  too short / no content ({len(skipped)}): "
               f"{', '.join(skipped[:10])}")
 
-
-# --------------------------------------------------------------------------
-
 USAGE = """usage:
-    python3 scrapers/scraper.py discover <party|all>
-    python3 scrapers/scraper.py fetch    <party|all> [data_dir]
-    python3 scrapers/scraper.py extract  <party|all> [data_dir] [out_dir]
+    python3 ingest/scraper.py discover <party|all>
+    python3 ingest/scraper.py fetch    <party|all> [data_dir]
+    python3 ingest/scraper.py extract  <party|all> [data_dir] [out_dir]
 """
 
 if __name__ == "__main__":

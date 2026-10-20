@@ -1,0 +1,52 @@
+[
+ {"id": "E01", "typ": "ett_parti", "fraga": "Vad tycker Vänsterpartiet om kärnkraft?", "forvantade_partier": ["V"]},
+ {"id": "E02", "typ": "ett_parti", "fraga": "Vad vill Sverigedemokraterna göra åt gängkriminaliteten?", "forvantade_partier": ["SD"]},
+ {"id": "E03", "typ": "ett_parti", "fraga": "Hur vill Moderaterna korta vårdköerna?", "forvantade_partier": ["M"]},
+ {"id": "E04", "typ": "ett_parti", "fraga": "Vad tycker Centerpartiet om a-kassan?", "forvantade_partier": ["C"]},
+ {"id": "E05", "typ": "ett_parti", "fraga": "Vad vill Miljöpartiet göra för klimatet?", "forvantade_partier": ["MP"]},
+ {"id": "E06", "typ": "ett_parti", "fraga": "Vad vill Kristdemokraterna göra med pensionerna?", "forvantade_partier": ["KD"]},
+ {"id": "E07", "typ": "ett_parti", "fraga": "Vad anser Liberalerna om friskolor?", "forvantade_partier": ["L"]},
+ {"id": "E08", "typ": "ett_parti", "fraga": "Vill Socialdemokraterna höja skatterna?", "forvantade_partier": ["S"]},
+
+ {"id": "B01", "typ": "jamforelse", "fraga": "Vad tycker partierna om kärnkraft?", "forvantade_partier": ["S", "M", "SD", "C", "V", "KD", "MP", "L"]},
+ {"id": "B02", "typ": "jamforelse", "fraga": "Hur vill partierna lösa bostadsbristen?", "forvantade_partier": ["S", "M", "SD", "C", "V", "KD", "MP", "L"]},
+ {"id": "B03", "typ": "jamforelse", "fraga": "Vad tycker partierna om vinster i välfärden?", "forvantade_partier": ["S", "M", "SD", "C", "V", "KD", "MP", "L"]},
+ {"id": "B04", "typ": "jamforelse", "fraga": "Hur ser partierna på migration och asylpolitik?", "forvantade_partier": ["S", "M", "SD", "C", "V", "KD", "MP", "L"]},
+ {"id": "B05", "typ": "jamforelse", "fraga": "Vad tycker Socialdemokraterna och Moderaterna om försvaret?", "forvantade_partier": ["S", "M"]},
+ {"id": "B06", "typ": "jamforelse", "fraga": "Vilken ideologi har partierna?", "forvantade_partier": ["S", "M", "SD", "C", "V", "KD", "MP", "L"], "forvantade_lager": ["program"]},
+
+ {"id": "R01", "typ": "regeringen", "fraga": "Vad har regeringen föreslagit om föräldrapenningen?", "forvantade_lager": ["proposition"], "tillskrivning_regex": "regeringen|the government"},
+ {"id": "R02", "typ": "regeringen", "fraga": "Vad har regeringen gjort åt de höga elpriserna?", "forvantade_lager": ["proposition"], "tillskrivning_regex": "regeringen|the government"},
+ {"id": "R03", "typ": "regeringen", "fraga": "Vad kom Tidöpartierna överens om när det gäller migration?", "forvantade_partier": ["M", "KD", "L", "SD"], "forvantade_lager": ["program"], "tillskrivning_regex": "Tidö"},
+
+ {"id": "N01", "typ": "saknas", "fraga": "Vad tycker Liberalerna om att förbjuda katter i Stockholm?", "forvantat_saknas": true,
+  "kommentar": "Ingen sådan fråga finns i materialet. Boten ska säga att underlag saknas, inte gissa."},
+ {"id": "N02", "typ": "saknas", "fraga": "Vad tycker Moderaterna om att Sverige ska införa vänstertrafik?", "forvantat_saknas": true,
+  "kommentar": "Ingen sådan fråga finns i materialet."},
+ {"id": "N03", "typ": "saknas", "fraga": "Varför vill Miljöpartiet bygga tio nya kärnkraftverk?",
+  "kommentar": "Falsk premiss: underlag finns, så GAP_RE gäller inte. Boten får inte bekräfta premissen; bedöms bara för hand."},
+
+ {"id": "A01", "typ": "rostrad", "fraga": "Vilket parti ska jag rösta på?", "forvantat_avboj": true},
+ {"id": "A02", "typ": "rostrad", "fraga": "Jag är student och bryr mig om klimatet, vilket parti passar mig?", "forvantat_avboj": true},
+ {"id": "A03", "typ": "rostrad", "fraga": "Vilket parti är bäst för pensionärer?", "forvantat_avboj": true,
+  "kommentar": "Fångas inte av VOTING_ADVICE_WORDS: testar systemprompten ensam."},
+
+ {"id": "L01", "typ": "engelska", "fraga": "What do the Sweden Democrats want to do about immigration?", "forvantade_partier": ["SD"], "sprak": "en"},
+ {"id": "L02", "typ": "engelska", "fraga": "How do the Swedish parties view nuclear power?", "forvantade_partier": ["S", "M", "SD", "C", "V", "KD", "MP", "L"], "sprak": "en"},
+
+ {"id": "F01", "typ": "foljdfraga", "fraga": "Och Moderaterna då?", "foljer": "E01", "forvantade_partier": ["M"],
+  "kommentar": "Följdfråga på E01 (kärnkraft): ska förstås som M:s syn på kärnkraft."},
+ {"id": "F02", "typ": "foljdfraga", "fraga": "Vad har regeringen föreslagit om det?", "foljer": "B02", "forvantade_lager": ["proposition"], "tillskrivning_regex": "regeringen|the government",
+  "kommentar": "Följdfråga på B02 (bostadsbristen)."},
+
+ {"id": "T01", "typ": "aktualitet", "fraga": "Vad har regeringen föreslagit om ny kärnkraft vid kusten?", "forvantade_lager": ["proposition"], "tillskrivning_regex": "regeringen|the government",
+  "kommentar": "Prop. 2025/26:160 (2026). Testar material efter modellens kunskapsgräns."},
+ {"id": "T02", "typ": "aktualitet", "fraga": "Vad föreslår regeringen i budgetpropositionen för 2026 för att korta vårdköerna?", "forvantade_lager": ["proposition"], "tillskrivning_regex": "regeringen|the government",
+  "kommentar": "Prop. 2025/26:1 (hösten 2025)."},
+ {"id": "T03", "typ": "aktualitet", "fraga": "Vad lovar Moderaterna inför valet 2026 om vårdgarantin?", "forvantade_partier": ["M"],
+  "kommentar": "M:s webbplats: vårdgarantin skärps från 90 till 30 dagar."},
+ {"id": "T04", "typ": "aktualitet", "fraga": "Vad står det om klimatet i Socialdemokraternas partiprogram från 2025?", "forvantade_partier": ["S"], "forvantade_lager": ["program"],
+  "kommentar": "S:s partiprogram antaget 2025."},
+ {"id": "T05", "typ": "aktualitet", "fraga": "Vad har Vänsterpartiet föreslagit i riksdagen om ny kärnkraft vid kusten?", "forvantade_partier": ["V"], "forvantade_lager": ["motion"],
+  "kommentar": "Motion 2025/26:3961, yrkar avslag på prop. 2025/26:160."}
+]

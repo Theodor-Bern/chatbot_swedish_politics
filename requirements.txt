@@ -1,0 +1,10 @@
+requests
+trafilatura
+beautifulsoup4
+sentence-transformers
+torch
+numpy
+pymupdf
+google-genai
+streamlit>=1.40,<2
+matplotlib
