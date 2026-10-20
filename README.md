@@ -14,9 +14,11 @@ Varje påstående i svaret hänvisar till en källa.
 | `motion` | Partiernas motioner 2022/23–2025/26, yrkande + motivering | data.riksdagen.se | `ingest/motion.py` |
 | `proposition` | Regeringens (M, KD, L) propositioner: sammanfattning, reformavsnitten i budget- och vårpropositionerna, samt politikens inriktning och reformförslag per utgiftsområde | data.riksdagen.se | `ingest/proposition.py` |
 
-Betänkanden och voteringar ingick i en tidigare version men togs bort: punktvisa
-reservationer och voteringar gav smala, missvisande svar på breda frågor. Koden
-finns kvar i git-historiken.
+Betänkanden och voteringar (lagret `did`) ingick i en tidigare version men togs
+bort av två skäl. Dels gav punktvisa reservationer och voteringar smala,
+missvisande svar på breda frågor. Dels speglar en röst inte alltid partiets egen
+politik, eftersom partier ibland röstar taktiskt, till exempel för att stödja ett
+samarbetsparti eller en överenskommelse. Koden finns kvar i git-historiken.
 
 Några medvetna val:
 
