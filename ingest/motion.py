@@ -14,12 +14,7 @@ The HTML has no explicit link between a yrkande and its section — only that
 the text repeats. We find the link through word overlap: which section shares
 the most uncommon words with the yrkande.
 
-Run:
-    python ingest/motion.py inspect <one motion>.html
-    python ingest/motion.py build data/html/mot-2022-2025.html out/motion_chunks.jsonl
-    python ingest/motion.py subtyp out/motion_subtyp.json    # Riksdagen's motion type, from the API
-
-The output is read by rag_index.py (the MOTION layer) — search and answering
+The output is read by rag_index.py (the MOTION layer), search and answering
 happen there and in answer.py, not here. The output's JSON field names
 (parti, sektion_text, yrkande_nr, undertecknare, …) are its data format.
 """
@@ -75,9 +70,8 @@ def read_html(path):
         return fh.read()
 
 
-# --------------------------------------------------------------------------
+
 # document metadata
-# --------------------------------------------------------------------------
 
 def document_info(soup):
     """rm, beteckning, party, first signatory, title."""
@@ -115,10 +109,8 @@ def extract_signatories(soup):
             names.append(text)
     return names
 
-
-# --------------------------------------------------------------------------
 # yrkanden
-# --------------------------------------------------------------------------
+
 
 def extract_yrkanden(soup):
     """One string per yrkande, in order.
@@ -138,9 +130,7 @@ def extract_yrkanden(soup):
     return yrkanden
 
 
-# --------------------------------------------------------------------------
 # heading sections
-# --------------------------------------------------------------------------
 
 def extract_sections(soup):
     """[{'heading': str, 'body': [str, ...]}, ...] — one entry per heading,
@@ -181,9 +171,8 @@ def extract_sections(soup):
     return sections
 
 
-# --------------------------------------------------------------------------
+
 # matching: which yrkande belongs to which section?
-# --------------------------------------------------------------------------
 
 # Light Swedish stemming (same list as rag_index.py) — cuts inflection endings
 # so "landsbygden"/"landsbygd" count as the same word. Ordered longest first,
@@ -227,9 +216,8 @@ def best_match(yrkande, sections):
     return best_i, best_score
 
 
-# --------------------------------------------------------------------------
-# chunk — what actually gets saved
-# --------------------------------------------------------------------------
+
+# chunk, what actually gets saved
 
 @dataclass
 class Chunk:
@@ -290,9 +278,8 @@ def parse_motion(path):
     return chunks
 
 
-# --------------------------------------------------------------------------
-# build — run over a whole folder of motions
-# --------------------------------------------------------------------------
+# build, run over a whole folder of motions
+
 
 def build(html_folder, out_path):
     # rglob, not glob: the bulk export can hold one folder per document

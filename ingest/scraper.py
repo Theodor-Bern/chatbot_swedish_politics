@@ -394,9 +394,8 @@ def discover(site, session, verbose=True):
     return pages
 
 
-# --------------------------------------------------------------------------
+
 # Phase 1: fetch
-# --------------------------------------------------------------------------
 
 def session_with_agent():
     session = requests.Session()
@@ -471,10 +470,7 @@ def fetch(party_code, data_dir=DEFAULT_DATA_DIR):
         encoding="utf-8")
     print(f"saved {len(index)} pages to {out_dir}")
 
-
-# --------------------------------------------------------------------------
 # Phase 2: extract
-# --------------------------------------------------------------------------
 
 def extract(party_code, data_dir=DEFAULT_DATA_DIR, out_dir=DEFAULT_OUT_DIR):
     """Pull the article text out of the saved HTML.
@@ -564,9 +560,6 @@ def extract(party_code, data_dir=DEFAULT_DATA_DIR, out_dir=DEFAULT_OUT_DIR):
     if skipped:
         print(f"  too short / no content ({len(skipped)}): "
               f"{', '.join(skipped[:10])}")
-
-
-# --------------------------------------------------------------------------
 
 USAGE = """usage:
     python3 ingest/scraper.py discover <party|all>

@@ -1,4 +1,4 @@
-"""Lokalt webbgränssnitt. Starta från projektmappen med streamlit run app.py."""
+"""Local web UI. Run from the project root: streamlit run app.py"""
 
 import os
 from pathlib import Path
@@ -19,12 +19,12 @@ LAYER_NAMES = {'said': 'partisidor', 'motion': 'motioner', 'program': 'partiprog
 
 @st.cache_resource(show_spinner=False)
 def load_index(path, fingerprint):
-    # Låset skyddar den delade sökmodellen om flera lokala flikar används.
+    # The lock guards the shared model when several tabs are open.
     return rag_index.Index(path), threading.Lock()
 
 
 def error_message(error):
-    # Visa inte råa API-fel: de kan innehålla tekniska detaljer eller nycklar.
+    # Never show raw API errors: they can contain keys.
     text = str(error).lower()
     if any(word in text for word in ('401', '403', 'api_key_invalid', 'unauthenticated')):
         return 'Gemini godkände inte åtkomsten. Kontrollera API-nyckeln och dess behörigheter.'
@@ -99,6 +99,7 @@ def main():
     if question and question.strip():
         try:
             with st.spinner('Läser underlaget, söker och formulerar svar…'):
+                # Reload the cached index when its files change.
                 fingerprint = tuple((name, (index_path / name).stat().st_mtime_ns,
                                      (index_path / name).stat().st_size) for name in INDEX_FILES)
                 idx, lock = load_index(str(index_path), fingerprint)
@@ -106,6 +107,7 @@ def main():
                     response, hits, info, _ = bot.answer_with_tools(
                         idx, question.strip(), model=model,
                         history=[(r['question'], r['answer']) for r in chat])
+                # Link buttons only for cited sources, one per URL.
                 links, seen = [], set()
                 cited = set(bot.cited_numbers(response))
                 for number, (_, meta) in enumerate(hits, 1):
