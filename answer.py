@@ -53,8 +53,8 @@ ALIAS = {
 # Questions where the right answer is NOT to answer (voting advice).
 VOTING_ADVICE_WORDS = re.compile(
     r"vilket parti (ska|bör) jag|vilket parti är bäst|bästa partiet|passar mig|"
-    r"rösta på|vem ska jag rösta|"
-    r"rekommendera(r)? du|vad ska jag rösta|hjälp mig välja", re.IGNORECASE)
+    r"(ska|bör) jag rösta|"     # first person only: not "vem röstar Åkesson på?"
+    r"rekommendera(r)? du|hjälp mig välja", re.IGNORECASE)
 
 
 # parameter extraction
@@ -205,7 +205,10 @@ REGLER, i fallande ordning:
    ett parti — använd aldrig en källa om ett annat ämne som om den handlade
    om det efterfrågade. Saknas material fyller du aldrig luckan med
    gissningar. Luckorna samlar du i EN kort mening i slutet av svaret
-   ("C:s och KD:s motioner tar inte upp frågan."), inte en gång per parti.
+   ("C:s och KD:s motioner tar inte upp kärnkraft."), inte en gång per parti.
+   Meningen nämner ämnet, inte frågans formulering: skriv "tar inte upp
+   nationalism", aldrig "tar inte upp vilket parti som är mest
+   nationalistiskt".
    Att inget hittades betyder att källan inte tar upp frågan: skriv aldrig
    att ett partis program, motioner eller webbplats "saknas".
 
