@@ -141,33 +141,7 @@ python3 -m unittest discover -s tests -p 'test_app.py'         # app tests, no A
   day, so a run resumes where it stopped (`--only` and `--redo` select
   questions). Answers are graded by hand in `grading.csv`.
 
-## Rebuilding the data
+## Use the /out we attach in the hand in.
+The folder contains all chunks that is needed for the model to work. Otherwise you need to rebuild everything which takes many hours and we would have to hand in lots of data.
 
-`data/` and `out/` are not in git. To rebuild:
 
-1. Download motions and bills from data.riksdagen.se as HTML into
-   `data/html/mot-2022-2025.html/` and `data/html/prop-2022-2025.html/`. Put
-   the party programmes and the Tidö Agreement as PDFs in `data/pdf/`, with the
-   file names listed in `PROGRAMS` in `ingest/program.py`.
-2. Run:
-
-```sh
-python3 ingest/scraper.py fetch all && python3 ingest/scraper.py extract all
-python3 ingest/motion.py build data/html/mot-2022-2025.html out/motion_chunks.jsonl
-python3 ingest/motion.py subtyp out/motion_subtyp.json      # motion type from the Riksdag API
-python3 ingest/proposition.py build data/html/prop-2022-2025.html out/proposition_chunks.jsonl
-python3 ingest/program.py build
-python3 rag_index.py build      # hours on a laptop; vectors are cached per passage
-```
-
-If only metadata changed, `python3 rag_index.py build --bm25-only` skips the
-vectors.
-
-## Known limitations
-
-- e5's similarity scores are tightly packed (about 0.80–0.90), so a passage on
-  a neighbouring topic can be retrieved. The prompt tells Gemini to leave it
-  out. A reranker would be the next step.
-- The relevance cutoffs were calibrated by hand.
-- Party websites change without notice. The source list shows when each page
-  was last modified.
