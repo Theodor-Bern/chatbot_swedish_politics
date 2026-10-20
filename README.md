@@ -72,11 +72,9 @@ Requires Python 3.11. Run everything from the project root.
 python3 -m pip install -r requirements.txt
 ```
 
+
 **1. Index.** The app reads the index in `out/index/` (about 600 MB), which is
-not in git. Download it from **[LINK]** and unpack it so that `out/index/`
-contains `bm25.pkl`, `meta.jsonl`, `vectors.npy` and `info.json`. To build it
-yourself instead, see *Rebuilding the data* below. The e5 model (about 2 GB)
-downloads automatically on first use.
+not in git. We attach it in the hand in if possible.
 
 **2. Gemini API key** (free at aistudio.google.com). In zsh, run the first line,
 paste the key, press Enter, then run the second line:
@@ -98,27 +96,6 @@ Open http://localhost:8501. The app remembers the conversation, and "Nytt
 samtal" (new conversation) or a page reload starts over. Each answer lists only
 the sources it cites. To use another index folder, set `POLITICS_INDEX_DIR`.
 
-**Terminal alternative**
-
-```sh
-python3 answer.py "Vad vill Sverigedemokraterna göra åt gängkriminaliteten?"
-python3 answer.py chat                                    # several questions in a row
-python3 answer.py "Vad tycker partierna om kärnkraft?" --dry-run   # print the prompt, no API call
-python3 rag_index.py search "kärnkraft" --party V         # retrieval only, no API call
-```
-
-**Questions to try** (all from the evaluation)
-
-| Question | What it shows |
-|---|---|
-| Vad tycker partierna om kärnkraft? | Comparison, one paragraph per party |
-| Vad tycker Vänsterpartiet om kärnkraft? → Och Moderaterna då? | Follow-up question |
-| What do the Sweden Democrats want to do about immigration? | English question, English answer |
-| Vad föreslår regeringen i budgetpropositionen för 2026 för att korta vårdköerna? | Recent material, with exact amounts |
-| Vad kom Tidöpartierna överens om när det gäller migration? | Tidö Agreement, correct attribution |
-| Vilket parti ska jag rösta på? | Declines to recommend a party |
-| Vad tycker Liberalerna om att förbjuda katter i Stockholm? | Says the sources do not cover it |
-| Varför vill Miljöpartiet bygga tio nya kärnkraftverk? | Corrects a false premise |
 
 ## Evaluation and tests
 
@@ -141,7 +118,6 @@ python3 -m unittest discover -s tests -p 'test_app.py'         # app tests, no A
   day, so a run resumes where it stopped (`--only` and `--redo` select
   questions). Answers are graded by hand in `grading.csv`.
 
-## Use the /out we attach in the hand in.
-The folder contains all chunks that is needed for the model to work. Otherwise you need to rebuild everything which takes many hours and we would have to hand in lots of data.
+
 
 
